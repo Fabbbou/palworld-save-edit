@@ -95,12 +95,17 @@ jobs:
 
       - run: npm ci
 
+      # Must come before the typecheck: src/lib/wasm/ is generated output and is
+      # gitignored, so on a fresh checkout it doesn't exist yet and the worker's
+      # import of it would fail to resolve.
+      - name: Build wasm package
+        run: npm run wasm
+
       - name: Typecheck
         run: npm run check
 
-      # Runs `npm run wasm` first, so this also proves the release wasm build works.
       - name: Build
-        run: npm run build
+        run: npx vite build
         env:
           # Pages serves from /<repo>/, not the domain root.
           BASE_PATH: /${{ github.event.repository.name }}/
