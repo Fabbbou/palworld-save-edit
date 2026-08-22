@@ -408,12 +408,13 @@ mod tests {
 
     #[test]
     fn guid_hex_round_trips() {
+        // Obviously-synthetic: test data, not a GUID lifted from a real save.
         let guid: Guid = [
-            0x13, 0x34, 0x96, 0x5b, 0xe3, 0x75, 0x02, 0x48, 0x90, 0xbd, 0x19, 0xdc, 0xe3, 0xac,
-            0xe8, 0x75,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
         ];
         let hex = guid_to_hex(&guid);
-        assert_eq!(hex, "1334965be375024890bd19dce3ace875");
+        assert_eq!(hex, "00112233445566778899aabbccddeeff");
         assert_eq!(hex_to_guid(&hex), Some(guid));
     }
 
