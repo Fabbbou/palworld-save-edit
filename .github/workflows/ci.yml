@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Allows a manual deploy without pushing a commit.
+  workflow_dispatch:
+
+# Only one deploy at a time; a superseded run is cancelled rather than racing.
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup target add wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # NOTE: fixtures/ is gitignored (real saves contain SteamIDs and player names),
+      # so the fixture-backed tests skip themselves here rather than failing. What
+      # runs in CI is the synthetic coverage; the fixture tests are the local gate.
+      # See CONTRIBUTING.md for how to add a fixture when the game format moves.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build for wasm32
+        run: cargo build --workspace --target wasm32-unknown-unknown
+
+  wasm:
+    name: wasm boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Runs under Node rather than headless Chrome: these tests touch no DOM, only
+      # wasm-bindgen marshalling. See ADR-005.md.
+      - name: wasm-bindgen tests
+        run: wasm-pack test --node crates/palsave-wasm
+
+  web:
+    name: Web build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run check
+
+      # Runs `npm run wasm` first, so this also proves the release wasm build works.
+      - name: Build
+        run: npm run build
+        env:
+          # Pages serves from /<repo>/, not the domain root.
+          BASE_PATH: /${{ github.event.repository.name }}/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    name: Deploy to Pages
+    # The deploy gate: every check must pass first. A green site sitting on top of a
+    # red test suite is exactly how the tools this project replaces went stale.
+    needs: [rust, wasm, web]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

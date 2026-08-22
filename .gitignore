@@ -1,0 +1,10 @@
+/target
+node_modules/
+dist/
+
+# wasm-pack output, rebuilt from crates/palsave-wasm
+src/lib/wasm/
+
+# real save files: SteamIDs + player names, never commit
+/fixtures/*
+!/fixtures/README.md
