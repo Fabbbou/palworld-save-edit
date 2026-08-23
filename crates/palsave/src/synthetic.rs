@@ -471,11 +471,21 @@ fn character_map_value(ids: &WorldIds) -> Vec<u8> {
     v
 }
 
-/// One `ItemContainerSaveData` entry holding a single occupied slot.
+/// One `ItemContainerSaveData` entry holding **two** occupied slots.
 ///
-/// The slot's `DynamicId` is non-zero and matches [`dynamic_item_array_value`], so the
-/// durability join has something to resolve. An all-zero id — the "no per-instance
-/// state" sentinel — would leave that path untested.
+/// Two, not one, and the difference is load-bearing:
+///
+/// - Slot 0's `DynamicId` is non-zero and matches [`dynamic_item_array_value`], so the
+///   durability join has something to resolve.
+/// - Slot 1's is the all-zero sentinel — an ordinary stack with no per-instance state,
+///   the *common* case in a real save.
+///
+/// Only having the first meant every field the UI reads was always populated, so the
+/// "this item has no durability" render path was never exercised by any test. That gap
+/// shipped a crash: `Option::None` crosses the wasm boundary as `undefined`, a
+/// `!== null` guard let it through, and the Pals & items tab hung on "Loading…" for
+/// every real save. A fixture where everything is present cannot catch a
+/// missing-field bug.
 fn item_container_map_value(ids: &WorldIds) -> Vec<u8> {
     let mut v = Vec::new();
     write_u32_le(&mut v, 0); // keys-to-remove count
@@ -483,7 +493,7 @@ fn item_container_map_value(ids: &WorldIds) -> Vec<u8> {
 
     v.extend_from_slice(&container_key(ids.container_id));
 
-    let slot_blob = item_container::encode_slot(&item_container::ItemContainerSlot {
+    let with_state = item_container::encode_slot(&item_container::ItemContainerSlot {
         slot_index: 0,
         count: 5,
         item: item_container::ItemId {
@@ -495,8 +505,21 @@ fn item_container_map_value(ids: &WorldIds) -> Vec<u8> {
         },
         trailing_bytes: Vec::new(),
     });
+    let plain = item_container::encode_slot(&item_container::ItemContainerSlot {
+        slot_index: 1,
+        count: 63,
+        item: item_container::ItemId {
+            static_id: ascii("Wood"),
+            // All-zero: one plank is like any other, so there is no row to join to.
+            dynamic_id: item_container::DynamicId {
+                created_world_id: [0u8; 16],
+                local_id_in_created_world: [0u8; 16],
+            },
+        },
+        trailing_bytes: Vec::new(),
+    });
     v.extend_from_slice(&container_value(
-        &raw_data_property(&slot_blob),
+        &[raw_data_property(&with_state), raw_data_property(&plain)],
         "PalItemSlotSaveData",
         42,
     ));
@@ -555,19 +578,26 @@ fn raw_data_property(blob: &[u8]) -> Vec<u8> {
     body
 }
 
-/// A container value: `Slots` (array of one body) plus `SlotNum`.
-fn container_value(slot_body: &[u8], struct_type: &str, slot_num: i32) -> Vec<u8> {
+/// A container value: `Slots` plus `SlotNum`.
+fn container_value(slot_bodies: &[Vec<u8>], struct_type: &str, slot_num: i32) -> Vec<u8> {
+    // The nested element tag's `size` is the total of *all* element bodies, not one of
+    // them — measured on real saves by
+    // `array_inner_tag_size_covers_all_element_bodies`. With a single-slot fixture the
+    // two were indistinguishable, so writing it correctly only started to matter once
+    // a container held more than one thing.
+    let bodies_len: usize = slot_bodies.iter().map(|b| b.len()).sum();
+
     // Slots: ArrayProperty<StructProperty>. The element tag is written once, before
     // the bodies — and is present even for a zero-length array (see ADR-003.md).
     let slots_value = {
         let mut a = Vec::new();
-        write_u32_le(&mut a, 1); // element count
+        write_u32_le(&mut a, slot_bodies.len() as u32); // element count
         write_property_tag(
             &mut a,
             &PropertyTag {
                 name: ascii("Slots"),
                 type_name: ascii("StructProperty"),
-                size: slot_body.len() as u32,
+                size: bodies_len as u32,
                 index: 0,
                 extra: TagExtra::Struct {
                     struct_type: ascii(struct_type),
@@ -577,7 +607,9 @@ fn container_value(slot_body: &[u8], struct_type: &str, slot_num: i32) -> Vec<u8
             },
             true,
         );
-        a.extend_from_slice(slot_body);
+        for body in slot_bodies {
+            a.extend_from_slice(body);
+        }
         a
     };
 
@@ -630,7 +662,7 @@ fn pal_container_map_value(ids: &WorldIds) -> Vec<u8> {
     });
     v.extend_from_slice(&container_key(ids.pal_storage_container_id));
     v.extend_from_slice(&container_value(
-        &raw_data_property(&occupied),
+        &[raw_data_property(&occupied)],
         "PalContainerCharacterSlotSaveData",
         960,
     ));
@@ -640,7 +672,7 @@ fn pal_container_map_value(ids: &WorldIds) -> Vec<u8> {
     // test that cares would compare instance ids, which are identical either way.
     v.extend_from_slice(&container_key(ids.pal_party_container_id));
     v.extend_from_slice(&container_value(
-        &raw_data_property(&occupied),
+        &[raw_data_property(&occupied)],
         "PalContainerCharacterSlotSaveData",
         5,
     ));

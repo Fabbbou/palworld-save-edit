@@ -175,7 +175,8 @@ fn attaching_a_player_save_resolves_their_inventory() {
     assert!(!get(&common, "missing").as_bool().unwrap());
 
     let slots = js_sys::Array::from(&get(&common, "slots"));
-    assert_eq!(slots.length(), 1);
+    assert_eq!(slots.length(), 2);
+
     let slot = slots.get(0);
     assert_eq!(get(&slot, "static_id").as_string().unwrap(), "ClothArmor");
     assert_eq!(get(&slot, "count").as_f64().unwrap(), 5.0);
@@ -183,6 +184,21 @@ fn attaching_a_player_save_resolves_their_inventory() {
     // DynamicId is non-zero in the fixture precisely so this can't pass by returning
     // the "no per-instance state" null.
     assert_eq!(get(&slot, "durability").as_f64().unwrap(), 150.0);
+
+    // The second slot is an ordinary stack with no per-instance state — the common case
+    // in a real save, and the one that used to be untestable because every field in the
+    // fixture was populated. An absent Option must cross as `null`, not `undefined`:
+    // `save-types.ts` declares these fields `T | null`, and a UI guard comparing against
+    // null let `undefined` through and crashed the whole screen.
+    let plain = slots.get(1);
+    assert_eq!(get(&plain, "static_id").as_string().unwrap(), "Wood");
+    assert_eq!(get(&plain, "count").as_f64().unwrap(), 63.0);
+    assert!(
+        get(&plain, "durability").is_null(),
+        "an absent Option must serialize as null, not undefined"
+    );
+    assert!(get(&plain, "ammo_static_id").is_null());
+    assert!(get(&plain, "egg_character_id").is_null());
 
     // Detaching really removes it.
     handle.detach_player_save(&uid);

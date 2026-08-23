@@ -104,6 +104,24 @@ test('dropping level + player together resolves the inventory', async ({ page })
   // fixture's slot carries a non-zero DynamicId precisely so this can't pass on the
   // "no per-instance state" path.
   await expect(page.getByRole('cell', { name: '150 dur' })).toBeVisible();
+
+  // The other slot is an ordinary stack with nothing to join to. It must still render.
+  // This is the regression guard for the crash that hung this tab on "Loading…" for
+  // every real save: absent Options crossed the boundary as `undefined`, a `!== null`
+  // guard let one through, and `.toLocaleString()` threw on it. Every field in the old
+  // fixture was populated, so no test could see it.
+  await expect(page.getByRole('cell', { name: 'Wood' })).toBeVisible();
+});
+
+test('a save with no page errors renders every screen', async ({ page }) => {
+  // A thrown render error leaves the tab spinning rather than showing anything, so an
+  // assertion on visible text can pass while the screen is broken. beforeEach turns
+  // pageerror into a failure; this walks every tab so there is somewhere for it to fire.
+  await load(page, [LEVEL, PLAYER]);
+  for (const tab of ['tab-players', 'tab-inventory', 'tab-migrate', 'tab-guilds']) {
+    await page.getByTestId(tab).click();
+    await expect(page.locator('main')).toBeVisible();
+  }
 });
 
 test('dropping level + player together resolves the pal box', async ({ page }) => {

@@ -231,7 +231,12 @@
                           {#if slot.egg_character_id}
                             contains {slot.egg_character_id}
                           {:else}
-                            {#if slot.durability !== null}
+                            <!-- Loose `!= null` on purpose: it covers null and
+                                 undefined alike, so this stays correct even if a
+                                 serializer somewhere goes back to emitting undefined.
+                                 A truthiness check would be wrong — durability 0 is a
+                                 real, worth-showing value. -->
+                            {#if slot.durability != null}
                               {slot.durability.toLocaleString()} dur
                             {/if}
                             {#if slot.remaining_bullets}

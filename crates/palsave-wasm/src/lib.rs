@@ -84,8 +84,23 @@ fn parse_player_stat(name: &str) -> Result<characters::PlayerStat, JsValue> {
 /// `serde_wasm_bindgen` failures mean a view model didn't serialize — a bug here, not
 /// bad input from the caller, so it gets its own code rather than being conflated
 /// with a parse or edit failure.
+/// Serializes a view model to JS, with `None` crossing as **`null`** rather than
+/// `undefined`.
+///
+/// `serde_wasm_bindgen::to_value` defaults to `undefined`, which is a trap: every
+/// `Option` field in `save-types.ts` is declared `T | null`, so the declared type and
+/// the runtime value disagreed on every absent field. Nothing noticed for a long time
+/// because the UI reached for `??` and truthiness, which treat the two alike — until
+/// one `slot.durability !== null` check went looking for `null`, found `undefined`,
+/// took the branch, and threw on the next line.
+///
+/// Fixing it here rather than at the call site is the point: the alternative is
+/// remembering, forever, that the types are lying.
 fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
-    serde_wasm_bindgen::to_value(value).map_err(|e| js_error("serialization_failed", e))
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_missing_as_null(true);
+    value
+        .serialize(&serializer)
+        .map_err(|e| js_error("serialization_failed", e))
 }
 
 #[derive(Serialize)]
