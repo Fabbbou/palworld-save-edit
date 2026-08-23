@@ -182,6 +182,80 @@ fn attaching_a_player_save_resolves_their_inventory() {
     );
 }
 
+/// The diagnostic report is meant to be shareable, so its "no personal data" claim
+/// is enforced here rather than trusted. The synthetic save deliberately contains a
+/// player nickname, a guild name and a uid; none may appear in the report.
+#[wasm_bindgen_test]
+fn diagnostic_report_carries_no_personal_data() {
+    let handle = open(&synthetic_sav()).expect("open");
+    let report = handle.diagnostic_report().expect("diagnosticReport");
+
+    let json = js_sys::JSON::stringify(&report)
+        .expect("report serializes")
+        .as_string()
+        .unwrap();
+
+    // Names the synthetic save is known to contain.
+    for secret in ["Tester", "Original Name", "Wood"] {
+        assert!(
+            !json.contains(secret),
+            "diagnostic report leaked {secret:?}: {json}"
+        );
+    }
+
+    // Every uid is 32 hex characters; a run that long means one got through.
+    let bytes: Vec<char> = json.chars().collect();
+    let mut run = 0usize;
+    for c in bytes {
+        if c.is_ascii_hexdigit() {
+            run += 1;
+            assert!(run < 32, "diagnostic report contains a uid-shaped hex run");
+        } else {
+            run = 0;
+        }
+    }
+
+    // It still has to be useful.
+    assert!(json.contains("engine_version"));
+    assert!(json.contains("worldSaveData"));
+}
+
+/// Editing across the boundary, and the guards that keep a bad edit out of the save.
+#[wasm_bindgen_test]
+fn pal_stat_edits_cross_the_boundary() {
+    let mut handle = open(&synthetic_sav()).expect("open");
+
+    // An unknown stat name is refused rather than silently defaulted.
+    let err = handle
+        .set_pal_stat("whatever", "not_a_stat", 5.0)
+        .unwrap_err();
+    assert_eq!(get(&err, "code").as_string().unwrap(), "unknown_stat");
+
+    // Out-of-range is refused before anything is written.
+    let err = handle
+        .set_pal_stat("whatever", "talent_hp", 9999.0)
+        .unwrap_err();
+    assert_eq!(get(&err, "code").as_string().unwrap(), "value_out_of_range");
+
+    // The synthetic save's only character is a player, so a Pal edit finds nothing.
+    let err = handle
+        .set_pal_stat("whatever", "talent_hp", 50.0)
+        .unwrap_err();
+    assert_eq!(get(&err, "code").as_string().unwrap(), "player_not_found");
+
+    // The player's own level is editable, and the change survives an export/reopen.
+    let players = js_sys::Array::from(&handle.list_players().unwrap());
+    let uid = get(&players.get(0), "uid").as_string().unwrap();
+    handle
+        .set_player_stat(&uid, "level", 42.0)
+        .expect("setPlayerStat");
+
+    let exported = handle.export().expect("export");
+    let reopened = open(&exported).expect("reopen");
+    let after = js_sys::Array::from(&reopened.list_players().unwrap());
+    assert_eq!(get(&after.get(0), "level").as_f64().unwrap(), 42.0);
+}
+
 #[wasm_bindgen_test]
 fn errors_cross_with_machine_readable_codes() {
     let Err(err) = open(b"not a save file at all") else {

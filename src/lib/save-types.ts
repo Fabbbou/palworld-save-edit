@@ -153,6 +153,34 @@ export interface PlayerInventory {
   containers: ContainerView[];
 }
 
+/** Editable stats. Mirrors the string names `palsave-wasm` parses; an unknown one is
+ *  refused there rather than defaulted. */
+export type PalStatName = 'level' | 'exp' | 'talent_hp' | 'talent_shot' | 'talent_defense';
+export type PlayerStatName = 'level' | 'exp';
+
+/**
+ * A shareable report for bug reports. Carries format structure and counts only — no
+ * player names, uids, guild names or item ids. That's enforced by a test in
+ * `crates/palsave-wasm/tests/boundary.rs`, not just documented here.
+ */
+export interface DiagnosticReport {
+  engine_version: string;
+  save_game_version: number;
+  package_version_ue4: number;
+  package_version_ue5: number | null;
+  save_game_class: string;
+  container_format: 'PlZ' | 'PlM';
+  was_cnk_wrapped: boolean;
+  will_downgrade_to_zlib: boolean;
+  gvas_len: number;
+  top_level_properties: string[];
+  world_save_data_properties: string[];
+  guild_count: number | null;
+  player_count: number | null;
+  pal_count: number | null;
+  warnings: string[];
+}
+
 export interface Diagnostics {
   engine_version: string;
   save_game_version: number;
@@ -182,6 +210,10 @@ export interface SaveError {
     | 'malformed_uid'
     | 'not_a_player_save'
     | 'player_save_not_attached'
+    | 'field_not_present'
+    | 'value_out_of_range'
+    | 'blob_verification_failed'
+    | 'unknown_stat'
     | 'guild_not_found'
     | 'not_a_named_guild'
     | 'malformed_guild_id'

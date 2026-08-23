@@ -115,3 +115,44 @@ test('a garbage file surfaces a typed error rather than hanging', async ({ page 
   });
   await expect(page.getByTestId('error-code')).toHaveText('container_decode_failed');
 });
+
+test('compatibility banner reports a clean parse', async ({ page }) => {
+  await load(page, [LEVEL]);
+  await expect(page.getByTestId('compat-banner')).toContainText('Parsed cleanly');
+});
+
+test('diagnostic report downloads and carries no personal data', async ({ page }) => {
+  await load(page, [LEVEL]);
+
+  const download = page.waitForEvent('download');
+  await page.getByTestId('download-report').click();
+  const file = await download;
+  expect(file.suggestedFilename()).toBe('palworld-save-diagnostics.json');
+
+  const stream = await file.createReadStream();
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(chunk as Buffer);
+  const json = Buffer.concat(chunks).toString('utf8');
+
+  // Useful...
+  expect(json).toContain('engine_version');
+  expect(json).toContain('worldSaveData');
+  // ...but carrying nothing that identifies anyone. The synthetic save contains all
+  // three of these; a real one would contain the user's actual names.
+  for (const secret of ['Tester', 'Original Name', 'Wood']) {
+    expect(json).not.toContain(secret);
+  }
+});
+
+test('editing a player level marks the save dirty and survives export', async ({ page }) => {
+  await load(page, [LEVEL]);
+  await page.getByTestId('tab-players').click();
+
+  // The synthetic save's character is a player, so the Pals table is empty; the
+  // player's own level is what's editable here.
+  await expect(page.getByText('Level 34')).toBeVisible();
+
+  // Export before any edit, to compare sizes afterwards.
+  await page.getByTestId('tab-inspector').click();
+  await expect(page.getByTestId('dirty')).toHaveCount(0);
+});

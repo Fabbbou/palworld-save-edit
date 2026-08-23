@@ -117,6 +117,7 @@
   async function refreshAfterEdit() {
     edited = true;
     guilds = await loadGuilds();
+    players = await loadPlayers();
     summary = await client.summary();
   }
 
@@ -136,6 +137,24 @@
       error = e as SaveError;
     } finally {
       exporting = false;
+    }
+  }
+
+  /** A shareable report with no personal data in it — see save-types.ts. */
+  async function downloadReport() {
+    error = null;
+    try {
+      const report = await client.diagnosticReport();
+      const url = URL.createObjectURL(
+        new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' }),
+      );
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'palworld-save-diagnostics.json';
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      error = e as SaveError;
     }
   }
 
@@ -187,6 +206,26 @@
       Close Palworld — or stop your server — before replacing a save file.
     </p>
 
+    <!-- Compatibility state, always visible: a save that only partly decoded must
+         never look like one that decoded cleanly. -->
+    {#if diagnostics}
+      <p
+        class="banner {diagnostics.warnings.length === 0 ? 'ok' : 'warn'}"
+        data-testid="compat-banner"
+      >
+        {#if diagnostics.warnings.length === 0}
+          Parsed cleanly — every region of this save was understood.
+        {:else}
+          Parsed with {diagnostics.warnings.length}
+          {diagnostics.warnings.length === 1 ? 'warning' : 'warnings'}. Those regions are
+          preserved untouched on export but can't be edited — see the Inspector tab.
+        {/if}
+        <button class="link" onclick={downloadReport} data-testid="download-report">
+          Download diagnostic report
+        </button>
+      </p>
+    {/if}
+
     {#if summary.container.will_downgrade_to_zlib}
       <p class="banner warn">
         This save uses Oodle compression (PlM). No open-source Oodle compressor exists,
@@ -216,7 +255,7 @@
     {#if tab === 'inspector'}
       <Inspector {summary} {diagnostics} />
     {:else if tab === 'players'}
-      <Players {client} {players} />
+      <Players {client} {players} onedited={refreshAfterEdit} />
     {:else if tab === 'inventory'}
       <Inventory {client} {attachedPlayers} />
     {:else}
@@ -273,6 +312,21 @@
     font-size: 0.875rem;
     margin: 0 0 0.75rem;
     border: 1px solid transparent;
+  }
+  .banner.ok {
+    background: var(--surface);
+    color: var(--muted);
+    border-color: var(--border);
+  }
+  .banner .link {
+    background: none;
+    border: none;
+    padding: 0;
+    margin-left: 0.5rem;
+    color: inherit;
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
   }
   .banner.warn {
     background: var(--warn-soft);

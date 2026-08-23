@@ -1,14 +1,23 @@
 <script lang="ts">
   /** Screen 3: players and the Pals they own. Read-only. */
-  import type { PalSummary, PlayerDetail, PlayerSummary, SaveError } from '../save-types';
+  import type {
+    PalStatName,
+    PalSummary,
+    PlayerDetail,
+    PlayerSummary,
+    SaveError,
+  } from '../save-types';
   import type { SaveClient } from '../worker/client';
 
   let {
     client,
     players,
+    onedited,
   }: {
     client: SaveClient;
     players: PlayerSummary[];
+    /** Fired after a successful edit so the parent can refresh and mark the save dirty. */
+    onedited: () => void;
   } = $props();
 
   let selectedUid = $state<string | null>(null);
@@ -17,6 +26,54 @@
   let loading = $state(false);
   let search = $state('');
   let sortKey = $state<'level' | 'name' | 'iv'>('level');
+
+  /** `${instanceId}:${stat}` of the cell currently being edited, if any. */
+  let editing = $state<string | null>(null);
+  let draft = $state('');
+  let saving = $state(false);
+
+  const EDITABLE: { stat: PalStatName; label: string; min: number; max: number }[] = [
+    { stat: 'level', label: 'Level', min: 1, max: 255 },
+    { stat: 'talent_hp', label: 'HP IV', min: 0, max: 100 },
+    { stat: 'talent_shot', label: 'Attack IV', min: 0, max: 100 },
+    { stat: 'talent_defense', label: 'Defense IV', min: 0, max: 100 },
+  ];
+
+  function beginEdit(pal: PalSummary, stat: PalStatName, current: number | null) {
+    if (current === null) return; // absent fields are refused by the core, not inserted
+    editing = `${pal.instance_id}:${stat}`;
+    draft = String(current);
+  }
+
+  async function commit(pal: PalSummary, stat: PalStatName) {
+    const value = Number(draft);
+    const spec = EDITABLE.find((e) => e.stat === stat);
+    // Guard here for a fast, specific message; the core re-checks and is the
+    // authority — this is convenience, not the safety boundary.
+    if (!Number.isInteger(value) || (spec && (value < spec.min || value > spec.max))) {
+      error = {
+        code: 'value_out_of_range',
+        message: spec
+          ? `${spec.label} must be a whole number between ${spec.min} and ${spec.max}.`
+          : 'Invalid value.',
+      };
+      editing = null;
+      return;
+    }
+
+    saving = true;
+    error = null;
+    try {
+      await client.setPalStat(pal.instance_id, stat, value);
+      if (selectedUid) detail = await client.player(selectedUid);
+      onedited();
+    } catch (e) {
+      error = e as SaveError;
+    } finally {
+      saving = false;
+      editing = null;
+    }
+  }
 
   // Auto-select when there's only one player — the common single-player case, where
   // making someone click the only row is pure friction.
@@ -167,9 +224,54 @@
                     {#if pal.rank}<span class="badge">★{pal.rank}</span>{/if}
                     {#if pal.gender}<span class="gender">{pal.gender === 'Female' ? '♀' : '♂'}</span>{/if}
                   </td>
-                  <td>{pal.level ?? '—'}</td>
+                  <td>
+                    {#if editing === `${pal.instance_id}:level`}
+                      <!-- svelte-ignore a11y_autofocus -->
+                      <input
+                        class="cell"
+                        type="number"
+                        autofocus
+                        bind:value={draft}
+                        disabled={saving}
+                        onblur={() => commit(pal, 'level')}
+                        onkeydown={(e) => {
+                          if (e.key === 'Enter') commit(pal, 'level');
+                          if (e.key === 'Escape') (editing = null);
+                        }}
+                      />
+                    {:else}
+                      <button
+                        class="editable"
+                        data-testid="edit-level"
+                        onclick={() => beginEdit(pal, 'level', pal.level)}
+                      >{pal.level ?? '—'}</button>
+                    {/if}
+                  </td>
                   <td class="mono ivs">
-                    {pal.talent_hp ?? '—'}/{pal.talent_shot ?? '—'}/{pal.talent_defense ?? '—'}
+                    {#each [['talent_hp', pal.talent_hp], ['talent_shot', pal.talent_shot], ['talent_defense', pal.talent_defense]] as [stat, current], i (stat)}
+                      {#if i > 0}<span class="sep">/</span>{/if}
+                      {#if editing === `${pal.instance_id}:${stat}`}
+                        <!-- svelte-ignore a11y_autofocus -->
+                        <input
+                          class="cell iv"
+                          type="number"
+                          autofocus
+                          bind:value={draft}
+                          disabled={saving}
+                          onblur={() => commit(pal, stat as PalStatName)}
+                          onkeydown={(e) => {
+                            if (e.key === 'Enter') commit(pal, stat as PalStatName);
+                            if (e.key === 'Escape') (editing = null);
+                          }}
+                        />
+                      {:else}
+                        <button
+                          class="editable"
+                          data-testid="edit-{stat}"
+                          onclick={() => beginEdit(pal, stat as PalStatName, current as number | null)}
+                        >{current ?? '—'}</button>
+                      {/if}
+                    {/each}
                   </td>
                   <td>{pal.friendship_point?.toLocaleString() ?? '—'}</td>
                   <td class="passives">

@@ -1217,3 +1217,148 @@ fn a_level_save_is_rejected_as_a_player_save() {
     let err = inventory::player_inventory(&level.gvas, &level.gvas).unwrap_err();
     assert_eq!(err.code(), "not_a_player_save");
 }
+
+/// Phase A's gate: editing one Pal's stat changes that stat and nothing else.
+///
+/// The nested splice touches two buffers — the RawData blob and the save — so a
+/// missed size fixup at either level corrupts everything after the edit point. This
+/// asserts every *other* Pal is byte-identical, which is what catches that; a wrong
+/// fixup shifts subsequent offsets and they all change at once.
+#[test]
+fn setting_a_pal_stat_changes_only_that_stat() {
+    use palsave::characters::{self, PalStat};
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/Level.sav");
+    if !path.exists() {
+        eprintln!("no Level.sav fixture found, skipping");
+        return;
+    }
+    let container = palsave::container::decode(&std::fs::read(&path).unwrap()).unwrap();
+
+    let before = characters::list_all_pals(&container.gvas).unwrap();
+    // A Pal that actually has the field, so this tests an edit rather than a refusal.
+    let target = before
+        .iter()
+        .find(|p| p.talent_hp.is_some() && p.talent_hp != Some(99))
+        .expect("no Pal with a Talent_HP to edit");
+    let original_hp = target.talent_hp.unwrap();
+
+    let edited =
+        characters::set_pal_stat(&container.gvas, &target.instance_id, PalStat::TalentHp, 99)
+            .unwrap();
+
+    // Structural: every size field still agrees with the real byte layout.
+    palsave::edit::verify_reparses(&edited).expect("edited save failed verification");
+
+    let after = characters::list_all_pals(&edited).unwrap();
+    assert_eq!(after.len(), before.len(), "edit changed the number of Pals");
+
+    let mut changed = 0;
+    for (b, a) in before.iter().zip(after.iter()) {
+        if b.instance_id == target.instance_id {
+            assert_eq!(a.talent_hp, Some(99), "the edit did not land");
+            assert_ne!(original_hp, 99, "test picked a no-op value");
+            // Everything else about this Pal survives.
+            assert_eq!(a.character_id, b.character_id);
+            assert_eq!(a.level, b.level);
+            assert_eq!(a.talent_shot, b.talent_shot);
+            assert_eq!(a.talent_defense, b.talent_defense);
+            assert_eq!(a.passive_skills, b.passive_skills);
+            assert_eq!(a.friendship_point, b.friendship_point);
+            changed += 1;
+        } else {
+            assert_eq!(a, b, "an unrelated Pal changed");
+        }
+    }
+    assert_eq!(changed, 1, "expected exactly one Pal to change");
+
+    // Unrelated subsystems are untouched.
+    let guilds_before = palsave::guilds::list(&container.gvas).unwrap();
+    let guilds_after = palsave::guilds::list(&edited).unwrap();
+    assert_eq!(guilds_before, guilds_after, "the guild map changed");
+
+    eprintln!(
+        "Talent_HP {original_hp} -> 99 on one of {} Pals",
+        before.len()
+    );
+}
+
+/// A length-changing edit, which is the case that actually exercises the size fixups
+/// at both nesting levels. A same-length write would pass even with them missing.
+#[test]
+fn setting_a_pal_nickname_handles_length_changes() {
+    use palsave::characters;
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/Level.sav");
+    if !path.exists() {
+        return;
+    }
+    let container = palsave::container::decode(&std::fs::read(&path).unwrap()).unwrap();
+    let before = characters::list_all_pals(&container.gvas).unwrap();
+
+    let target = before
+        .iter()
+        .find(|p| p.nickname.is_some())
+        .expect("no Pal with a NickName to edit");
+
+    for name in ["A Considerably Longer Nickname Than Before", "Bo"] {
+        let edited =
+            characters::set_pal_nickname(&container.gvas, &target.instance_id, name).unwrap();
+        palsave::edit::verify_reparses(&edited).expect("verification failed");
+
+        let after = characters::list_all_pals(&edited).unwrap();
+        assert_eq!(after.len(), before.len());
+
+        let updated = after
+            .iter()
+            .find(|p| p.instance_id == target.instance_id)
+            .unwrap();
+        assert_eq!(updated.nickname.as_deref(), Some(name));
+
+        // Length changed, so every later Pal shifted in the file — but their decoded
+        // content must be identical.
+        for (b, a) in before.iter().zip(after.iter()) {
+            if b.instance_id != target.instance_id {
+                assert_eq!(a, b, "an unrelated Pal changed after a resizing edit");
+            }
+        }
+    }
+}
+
+#[test]
+fn out_of_range_and_missing_fields_are_refused() {
+    use palsave::characters::{self, PalStat};
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/Level.sav");
+    if !path.exists() {
+        return;
+    }
+    let container = palsave::container::decode(&std::fs::read(&path).unwrap()).unwrap();
+    let pals = characters::list_all_pals(&container.gvas).unwrap();
+    let target = pals.iter().find(|p| p.talent_hp.is_some()).unwrap();
+
+    // An IV the game would not accept.
+    let err = characters::set_pal_stat(
+        &container.gvas,
+        &target.instance_id,
+        PalStat::TalentHp,
+        9999,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "value_out_of_range");
+
+    let err = characters::set_pal_stat(&container.gvas, &target.instance_id, PalStat::Level, 0)
+        .unwrap_err();
+    assert_eq!(err.code(), "value_out_of_range");
+
+    // A Pal that doesn't exist.
+    let err = characters::set_pal_stat(&container.gvas, "nope", PalStat::TalentHp, 50).unwrap_err();
+    assert_eq!(err.code(), "player_not_found");
+
+    // A field this Pal genuinely lacks is refused, never inserted.
+    if let Some(no_nick) = pals.iter().find(|p| p.nickname.is_none()) {
+        let err =
+            characters::set_pal_nickname(&container.gvas, &no_nick.instance_id, "X").unwrap_err();
+        assert_eq!(err.code(), "field_not_present");
+    }
+}

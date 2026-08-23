@@ -16,8 +16,10 @@
 //! RawData blob — still error loudly. That split matches how `gvas::value` already
 //! treats regions it can't decode: degrade to opaque, never guess.
 
+use crate::edit::{self, Scalar};
 use crate::gvas::GvasError;
 use crate::gvas::nav::{Cursor, guid_to_hex, hex_to_guid};
+use crate::gvas::property::read_property_tag;
 use crate::rawdata::character;
 use crate::rawdata::error::RawDataError;
 use crate::world::{self, WorldError};
@@ -30,8 +32,30 @@ pub enum CharacterError {
     World(WorldError),
     Gvas(GvasError),
     RawData(RawDataError),
-    PlayerNotFound { uid: String },
-    MalformedUid { uid: String },
+    PlayerNotFound {
+        uid: String,
+    },
+    MalformedUid {
+        uid: String,
+    },
+    Edit(crate::edit::EditError),
+    /// The character exists but has no such property. Palworld omits a field until it
+    /// differs from its default, so this is common — and it is refused rather than
+    /// inserted, because adding a property changes the list length, which is the
+    /// map-entry-insert problem `edit/mod.rs` documents as unsupported.
+    FieldNotPresent {
+        field: &'static str,
+    },
+    /// A value outside what the game will accept. Refused, not clamped: a silently
+    /// corrected edit leaves the user unable to tell which one was wrong.
+    OutOfRange {
+        field: &'static str,
+        value: i64,
+        min: i64,
+        max: i64,
+    },
+    /// The character's blob no longer decodes after the edit. The buffer is discarded.
+    BlobVerificationFailed,
 }
 
 impl CharacterError {
@@ -45,6 +69,10 @@ impl CharacterError {
             CharacterError::RawData(_) => "rawdata_decode_failed",
             CharacterError::PlayerNotFound { .. } => "player_not_found",
             CharacterError::MalformedUid { .. } => "malformed_uid",
+            CharacterError::Edit(_) => "edit_failed",
+            CharacterError::FieldNotPresent { .. } => "field_not_present",
+            CharacterError::OutOfRange { .. } => "value_out_of_range",
+            CharacterError::BlobVerificationFailed => "blob_verification_failed",
         }
     }
 }
@@ -57,6 +85,11 @@ impl From<WorldError> for CharacterError {
 impl From<GvasError> for CharacterError {
     fn from(e: GvasError) -> Self {
         CharacterError::Gvas(e)
+    }
+}
+impl From<crate::edit::EditError> for CharacterError {
+    fn from(e: crate::edit::EditError) -> Self {
+        CharacterError::Edit(e)
     }
 }
 impl From<RawDataError> for CharacterError {
@@ -74,6 +107,19 @@ impl fmt::Display for CharacterError {
             CharacterError::PlayerNotFound { uid } => write!(f, "no player with uid {uid}"),
             CharacterError::MalformedUid { uid } => {
                 write!(f, "malformed uid {uid:?}: want 32 hex chars")
+            }
+            CharacterError::Edit(e) => write!(f, "{e}"),
+            CharacterError::FieldNotPresent { field } => {
+                write!(f, "this character has no {field} field to edit")
+            }
+            CharacterError::OutOfRange {
+                field,
+                value,
+                min,
+                max,
+            } => write!(f, "{field} must be between {min} and {max}, got {value}"),
+            CharacterError::BlobVerificationFailed => {
+                write!(f, "the edited character data no longer decodes")
             }
         }
     }
@@ -143,6 +189,19 @@ struct Character {
     blob_path: String,
     engine_major: u16,
     has_property_guid: bool,
+    /// The pieces an edit needs, which reading alone does not.
+    ///
+    /// Splicing a stat is two nested operations: patch inside `blob` using a
+    /// blob-relative chain `[save_parameter_entry, <stat>]`, then swap the whole
+    /// re-encoded blob into the save using the save-relative chain
+    /// `[world_entry, map_entry, raw_entry]`. Reading discards all four of these, so
+    /// they are kept here rather than re-walking the 8.5 MB map to recover them.
+    world_entry: crate::gvas::PropertyEntry,
+    map_entry: crate::gvas::PropertyEntry,
+    /// `RawData`, save-relative.
+    raw_entry: crate::gvas::PropertyEntry,
+    /// `SaveParameter`, blob-relative — the entry itself, not just its children.
+    save_parameter_entry: Option<crate::gvas::PropertyEntry>,
 }
 
 impl Character {
@@ -298,6 +357,8 @@ fn load(gvas: &[u8]) -> Result<Vec<Character>, CharacterError> {
             .get_opt(&save_parameter, "IsPlayer")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let save_parameter_entry =
+            crate::gvas::nav::find(&decoded.object, "SaveParameter").cloned();
 
         out.push(Character {
             player_uid: player_uid.filter(|u| u.chars().any(|c| c != '0')),
@@ -308,6 +369,10 @@ fn load(gvas: &[u8]) -> Result<Vec<Character>, CharacterError> {
             blob_path,
             engine_major: map.cursor.engine_major(),
             has_property_guid: map.cursor.has_property_guid(),
+            world_entry: map.world_entry.clone(),
+            map_entry: map.map_entry.clone(),
+            raw_entry: raw_entry.clone(),
+            save_parameter_entry,
         });
     }
     Ok(out)
@@ -390,4 +455,207 @@ pub fn list_all_pals(gvas: &[u8]) -> Result<Vec<PalSummary>, CharacterError> {
         .filter(|c| !c.is_player)
         .map(Character::to_pal)
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Editing
+// ---------------------------------------------------------------------------
+
+/// Editable Pal stats. A curated set, not an arbitrary path API: nothing would stop a
+/// caller writing nonsense into a field the game depends on, and the ranges below are
+/// only meaningful because the set is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PalStat {
+    Level,
+    Exp,
+    TalentHp,
+    TalentShot,
+    TalentDefense,
+}
+
+/// Editable player stats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerStat {
+    Level,
+    Exp,
+}
+
+/// `(property name, min, max)`. IVs are a 0..=100 game stat; level is capped well
+/// above the current game maximum so a future level-cap bump doesn't make this
+/// refuse valid saves, while still rejecting obvious garbage.
+const fn pal_stat_spec(stat: PalStat) -> (&'static str, i64, i64) {
+    match stat {
+        PalStat::Level => ("Level", 1, 255),
+        PalStat::Exp => ("Exp", 0, i64::MAX),
+        PalStat::TalentHp => ("Talent_HP", 0, 100),
+        PalStat::TalentShot => ("Talent_Shot", 0, 100),
+        PalStat::TalentDefense => ("Talent_Defense", 0, 100),
+    }
+}
+
+const fn player_stat_spec(stat: PlayerStat) -> (&'static str, i64, i64) {
+    match stat {
+        PlayerStat::Level => ("Level", 1, 255),
+        PlayerStat::Exp => ("Exp", 0, i64::MAX),
+    }
+}
+
+impl Character {
+    /// Rewrites one property inside this character's `RawData` blob and splices the
+    /// result back into the save.
+    ///
+    /// Two nested applications of the same engine, inner first. The blob's property
+    /// spans are blob-relative, so the inner chain must be spliced against `blob`;
+    /// only once the blob is whole again can it be swapped into the save. See
+    /// `gvas::nav` for why mixing the two buffers is the trap this guards against.
+    fn write_property(
+        &self,
+        level_gvas: &[u8],
+        field: &'static str,
+        value: &Scalar,
+    ) -> Result<Vec<u8>, CharacterError> {
+        let leaf = crate::gvas::nav::find(&self.save_parameter, field)
+            .ok_or(CharacterError::FieldNotPresent { field })?;
+        let save_parameter_entry =
+            self.save_parameter_entry
+                .as_ref()
+                .ok_or(CharacterError::FieldNotPresent {
+                    field: "SaveParameter",
+                })?;
+
+        // Encode against the type declared on disk, never against the caller's guess.
+        let mut pos = leaf.span.start;
+        let tag = read_property_tag(&self.blob, &mut pos, self.has_property_guid)?
+            .ok_or(CharacterError::FieldNotPresent { field })?;
+        let new_value = edit::encode_scalar(&tag, value)?;
+
+        // Inner: patch within the blob, fixing SaveParameter's size field.
+        let new_blob = edit::replace_property_value(
+            &self.blob,
+            &[save_parameter_entry, leaf],
+            new_value,
+            self.has_property_guid,
+        )?
+        .apply(&self.blob)?;
+
+        // `verify_reparses` needs a GVAS header and a blob has none, so the blob-level
+        // check is that it still decodes and consumes exactly — which is what catches
+        // a botched size fixup.
+        character::decode(&new_blob, self.has_property_guid)
+            .map_err(|_| CharacterError::BlobVerificationFailed)?;
+
+        // Outer: swap the whole blob into the save, fixing the enclosing sizes.
+        let edited = edit::replace_property_value(
+            level_gvas,
+            &[&self.world_entry, &self.map_entry, &self.raw_entry],
+            edit::byte_array_value(&new_blob),
+            self.has_property_guid,
+        )?
+        .apply(level_gvas)?;
+
+        edit::verify_reparses(&edited)?;
+        Ok(edited)
+    }
+}
+
+fn check_range(field: &'static str, value: i64, min: i64, max: i64) -> Result<(), CharacterError> {
+    if value < min || value > max {
+        return Err(CharacterError::OutOfRange {
+            field,
+            value,
+            min,
+            max,
+        });
+    }
+    Ok(())
+}
+
+/// Widens an integer to whatever the property's declared type needs. `Level` is a
+/// `ByteProperty` while `Exp` is an `Int64Property`, so the caller passing a plain
+/// `i64` is turned into the right shape here rather than at every call site.
+fn scalar_for(type_name: &str, value: i64) -> Option<Scalar> {
+    match type_name {
+        "ByteProperty" => u8::try_from(value).ok().map(Scalar::Byte),
+        "IntProperty" => i32::try_from(value).ok().map(Scalar::Int),
+        "Int64Property" => Some(Scalar::Int64(value)),
+        _ => None,
+    }
+}
+
+fn set_stat_on(
+    level_gvas: &[u8],
+    character: &Character,
+    field: &'static str,
+    value: i64,
+) -> Result<Vec<u8>, CharacterError> {
+    let leaf = crate::gvas::nav::find(&character.save_parameter, field)
+        .ok_or(CharacterError::FieldNotPresent { field })?;
+    let scalar = scalar_for(&leaf.type_name, value).ok_or(CharacterError::OutOfRange {
+        field,
+        value,
+        min: 0,
+        max: i64::from(u8::MAX),
+    })?;
+    character.write_property(level_gvas, field, &scalar)
+}
+
+/// Sets one stat on the Pal with `instance_id`, returning a fresh GVAS buffer.
+pub fn set_pal_stat(
+    level_gvas: &[u8],
+    instance_id: &str,
+    stat: PalStat,
+    value: i64,
+) -> Result<Vec<u8>, CharacterError> {
+    let (field, min, max) = pal_stat_spec(stat);
+    check_range(field, value, min, max)?;
+
+    let characters = load(level_gvas)?;
+    let target = characters
+        .iter()
+        .find(|c| !c.is_player && c.instance_id == instance_id)
+        .ok_or_else(|| CharacterError::PlayerNotFound {
+            uid: instance_id.to_string(),
+        })?;
+    set_stat_on(level_gvas, target, field, value)
+}
+
+/// Renames the Pal with `instance_id`.
+pub fn set_pal_nickname(
+    level_gvas: &[u8],
+    instance_id: &str,
+    nickname: &str,
+) -> Result<Vec<u8>, CharacterError> {
+    let characters = load(level_gvas)?;
+    let target = characters
+        .iter()
+        .find(|c| !c.is_player && c.instance_id == instance_id)
+        .ok_or_else(|| CharacterError::PlayerNotFound {
+            uid: instance_id.to_string(),
+        })?;
+    target.write_property(level_gvas, "NickName", &Scalar::Text(nickname.to_string()))
+}
+
+/// Sets one stat on the player with `uid`.
+pub fn set_player_stat(
+    level_gvas: &[u8],
+    uid: &str,
+    stat: PlayerStat,
+    value: i64,
+) -> Result<Vec<u8>, CharacterError> {
+    if hex_to_guid(uid).is_none() {
+        return Err(CharacterError::MalformedUid {
+            uid: uid.to_string(),
+        });
+    }
+    let (field, min, max) = player_stat_spec(stat);
+    check_range(field, value, min, max)?;
+
+    let characters = load(level_gvas)?;
+    let target = characters
+        .iter()
+        .find(|c| c.is_player && c.player_uid.as_deref() == Some(uid))
+        .ok_or_else(|| CharacterError::PlayerNotFound {
+            uid: uid.to_string(),
+        })?;
+    set_stat_on(level_gvas, target, field, value)
 }

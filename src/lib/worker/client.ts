@@ -8,7 +8,7 @@
  */
 
 import type { Request, ResultOf, Response } from './protocol';
-import type { SaveError } from '../save-types';
+import type { PalStatName, PlayerStatName, SaveError } from '../save-types';
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: SaveError) => void };
 
@@ -102,6 +102,22 @@ export class SaveClient {
 
   playerInventory(uid: string) {
     return this.#send({ id: this.#id(), kind: 'playerInventory', uid });
+  }
+
+  diagnosticReport() {
+    return this.#send({ id: this.#id(), kind: 'diagnosticReport' });
+  }
+
+  setPalStat(instanceId: string, stat: PalStatName, value: number) {
+    return this.#send({ id: this.#id(), kind: 'setPalStat', instanceId, stat, value });
+  }
+
+  setPalNickname(instanceId: string, nickname: string) {
+    return this.#send({ id: this.#id(), kind: 'setPalNickname', instanceId, nickname });
+  }
+
+  setPlayerStat(uid: string, stat: PlayerStatName, value: number) {
+    return this.#send({ id: this.#id(), kind: 'setPlayerStat', uid, stat, value });
   }
 
   diagnostics() {

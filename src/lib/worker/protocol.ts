@@ -16,6 +16,9 @@ import type {
   PalSummary,
   PlayerDetail,
   PlayerInventory,
+  DiagnosticReport,
+  PalStatName,
+  PlayerStatName,
   PlayerSummary,
   SaveError,
   SaveSummary,
@@ -34,6 +37,10 @@ export type Request =
   | { id: number; kind: 'detachPlayerSave'; uid: string }
   | { id: number; kind: 'attachedPlayers' }
   | { id: number; kind: 'playerInventory'; uid: string }
+  | { id: number; kind: 'diagnosticReport' }
+  | { id: number; kind: 'setPalStat'; instanceId: string; stat: PalStatName; value: number }
+  | { id: number; kind: 'setPalNickname'; instanceId: string; nickname: string }
+  | { id: number; kind: 'setPlayerStat'; uid: string; stat: PlayerStatName; value: number }
   | { id: number; kind: 'diagnostics' }
   | { id: number; kind: 'export' }
   | { id: number; kind: 'close' };
@@ -52,6 +59,10 @@ export interface ResultOf {
   detachPlayerSave: null;
   attachedPlayers: string[];
   playerInventory: PlayerInventory;
+  diagnosticReport: DiagnosticReport;
+  setPalStat: null;
+  setPalNickname: null;
+  setPlayerStat: null;
   diagnostics: Diagnostics;
   export: ArrayBuffer;
   close: null;

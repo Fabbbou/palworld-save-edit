@@ -53,6 +53,34 @@ fn inventory_error(e: inventory::InventoryError) -> JsValue {
     js_error(e.code(), e)
 }
 
+/// Stat names cross as strings. An unknown one is refused rather than defaulted —
+/// a typo silently editing the wrong stat is exactly the kind of quiet wrongness
+/// this project refuses elsewhere.
+fn parse_pal_stat(name: &str) -> Result<characters::PalStat, JsValue> {
+    match name {
+        "level" => Ok(characters::PalStat::Level),
+        "exp" => Ok(characters::PalStat::Exp),
+        "talent_hp" => Ok(characters::PalStat::TalentHp),
+        "talent_shot" => Ok(characters::PalStat::TalentShot),
+        "talent_defense" => Ok(characters::PalStat::TalentDefense),
+        other => Err(js_error(
+            "unknown_stat",
+            format!("unknown pal stat {other:?}"),
+        )),
+    }
+}
+
+fn parse_player_stat(name: &str) -> Result<characters::PlayerStat, JsValue> {
+    match name {
+        "level" => Ok(characters::PlayerStat::Level),
+        "exp" => Ok(characters::PlayerStat::Exp),
+        other => Err(js_error(
+            "unknown_stat",
+            format!("unknown player stat {other:?}"),
+        )),
+    }
+}
+
 /// `serde_wasm_bindgen` failures mean a view model didn't serialize — a bug here, not
 /// bad input from the caller, so it gets its own code rather than being conflated
 /// with a parse or edit failure.
@@ -227,6 +255,31 @@ struct PlayerInventoryView {
     containers: Vec<ContainerView>,
 }
 
+/// A report a user can attach to a bug report. Deliberately carries **no** personal
+/// data: no player names, no uids, no guild names, no item ids — only format
+/// structure and counts. That claim is enforced by a test, not by this comment
+/// (`diagnostic_report_carries_no_personal_data`).
+#[derive(Serialize)]
+struct DiagnosticReport {
+    engine_version: String,
+    save_game_version: u32,
+    package_version_ue4: u32,
+    package_version_ue5: Option<u32>,
+    save_game_class: String,
+    container_format: &'static str,
+    was_cnk_wrapped: bool,
+    will_downgrade_to_zlib: bool,
+    gvas_len: usize,
+    /// Property *names* — format structure, not user content.
+    top_level_properties: Vec<String>,
+    /// `worldSaveData` child names, same reasoning.
+    world_save_data_properties: Vec<String>,
+    guild_count: Option<usize>,
+    player_count: Option<usize>,
+    pal_count: Option<usize>,
+    warnings: Vec<String>,
+}
+
 #[derive(Serialize)]
 struct Diagnostics {
     engine_version: String,
@@ -267,6 +320,63 @@ pub fn open(bytes: &[u8]) -> Result<SaveHandle, JsValue> {
 impl SaveHandle {
     fn will_downgrade(&self) -> bool {
         self.container.algorithm == Algorithm::OodleMermaid
+    }
+
+    fn build_report(&self) -> Result<DiagnosticReport, JsValue> {
+        let file = palsave::gvas::GvasFile::parse(&self.container.gvas)
+            .map_err(|e| js_error("gvas_parse_failed", e))?;
+        let h = &file.header;
+
+        let world_save_data_properties = file
+            .properties
+            .iter()
+            .position(|p| p.name == "worldSaveData")
+            .and_then(|idx| file.materialize(idx).ok())
+            .and_then(|v| {
+                v.as_properties()
+                    .map(|props| props.iter().map(|p| p.name.clone()).collect())
+            })
+            .unwrap_or_default();
+
+        let mut warnings = Vec::new();
+        let guild_count = match guilds::list(&self.container.gvas) {
+            Ok(g) => Some(g.len()),
+            Err(e) => {
+                warnings.push(e.code().to_string());
+                None
+            }
+        };
+        let player_count = match characters::list_players(&self.container.gvas) {
+            Ok(p) => Some(p.len()),
+            Err(e) => {
+                warnings.push(e.code().to_string());
+                None
+            }
+        };
+        let pal_count = characters::list_all_pals(&self.container.gvas)
+            .ok()
+            .map(|p| p.len());
+
+        Ok(DiagnosticReport {
+            engine_version: format!(
+                "{}.{}.{}",
+                h.engine_version_major, h.engine_version_minor, h.engine_version_patch
+            ),
+            save_game_version: h.save_game_version,
+            package_version_ue4: h.package_version_ue4,
+            package_version_ue5: h.package_version_ue5,
+            save_game_class: file.save_game_type.clone(),
+            container_format: self.container_format(),
+            was_cnk_wrapped: self.container.was_cnk_wrapped,
+            will_downgrade_to_zlib: self.will_downgrade(),
+            gvas_len: self.container.gvas.len(),
+            top_level_properties: file.properties.iter().map(|p| p.name.clone()).collect(),
+            world_save_data_properties,
+            guild_count,
+            player_count,
+            pal_count,
+            warnings,
+        })
     }
 
     fn container_format(&self) -> &'static str {
@@ -436,6 +546,45 @@ impl SaveHandle {
             will_downgrade_to_zlib: self.will_downgrade(),
             warnings,
         })
+    }
+
+    /// A shareable diagnostic report — format structure and counts only, no personal
+    /// data. This is how a user reports breakage without sending their world.
+    #[wasm_bindgen(js_name = diagnosticReport)]
+    pub fn diagnostic_report(&self) -> Result<JsValue, JsValue> {
+        to_js(&self.build_report()?)
+    }
+
+    #[wasm_bindgen(js_name = setPalStat)]
+    pub fn set_pal_stat(
+        &mut self,
+        instance_id: &str,
+        stat: &str,
+        value: f64,
+    ) -> Result<(), JsValue> {
+        let stat = parse_pal_stat(stat)?;
+        let edited =
+            characters::set_pal_stat(&self.container.gvas, instance_id, stat, value as i64)
+                .map_err(character_error)?;
+        self.container.gvas = edited;
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = setPalNickname)]
+    pub fn set_pal_nickname(&mut self, instance_id: &str, nickname: &str) -> Result<(), JsValue> {
+        let edited = characters::set_pal_nickname(&self.container.gvas, instance_id, nickname)
+            .map_err(character_error)?;
+        self.container.gvas = edited;
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = setPlayerStat)]
+    pub fn set_player_stat(&mut self, uid: &str, stat: &str, value: f64) -> Result<(), JsValue> {
+        let stat = parse_player_stat(stat)?;
+        let edited = characters::set_player_stat(&self.container.gvas, uid, stat, value as i64)
+            .map_err(character_error)?;
+        self.container.gvas = edited;
+        Ok(())
     }
 
     /// The one call that returns something proportional to save size. Re-compresses

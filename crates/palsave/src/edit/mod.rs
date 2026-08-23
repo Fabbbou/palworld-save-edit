@@ -27,6 +27,8 @@ pub mod error;
 pub use error::EditError;
 
 use crate::gvas::PropertyEntry;
+use crate::gvas::primitives::{FString, write_fstring};
+use crate::gvas::property::{PropertyTag, TagExtra};
 use crate::gvas::property::{size_field_offset, value_offset};
 use std::ops::Range;
 
@@ -164,6 +166,111 @@ pub fn replace_property_value(
     }
 
     Ok(set)
+}
+
+/// A value to write into an existing scalar property.
+///
+/// Deliberately not a general `Value` -> bytes function: this exists to swap one
+/// scalar for another of the *same declared type*, which is the only edit the splice
+/// engine supports without count fixups.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Scalar {
+    Byte(u8),
+    Int(i32),
+    Int64(i64),
+    Float(f32),
+    /// Encoded as an `FString`; ASCII gets the 1-byte form, anything else UTF-16LE.
+    Text(String),
+}
+
+impl Scalar {
+    fn kind(&self) -> &'static str {
+        match self {
+            Scalar::Byte(_) => "byte",
+            Scalar::Int(_) => "int",
+            Scalar::Int64(_) => "int64",
+            Scalar::Float(_) => "float",
+            Scalar::Text(_) => "string",
+        }
+    }
+}
+
+/// Encodes `value` as the property's **declared** type, taken from the tag on disk.
+///
+/// The type is never inferred from the caller's `Scalar` — a mismatch is an error.
+/// Writing an `i32` into a `ByteProperty` would produce a save that still parses
+/// (the size field would be wrong by three bytes and the next property would be read
+/// from the wrong offset) and would be found only when the game refused to load it.
+pub fn encode_scalar(tag: &PropertyTag, value: &Scalar) -> Result<Vec<u8>, EditError> {
+    let property = tag.name.display_lossy();
+    let declared = tag.type_name.display_lossy();
+    let mismatch = || EditError::TypeMismatch {
+        property: property.clone(),
+        declared: declared.clone(),
+        given: value.kind(),
+    };
+
+    let mut out = Vec::new();
+    match declared.as_str() {
+        // A ByteProperty carries an enum-name in its tag; when that names a real enum
+        // the value is an FString label, not a number. Only the numeric form is
+        // writable here.
+        "ByteProperty" => match (&tag.extra, value) {
+            (TagExtra::Byte { enum_type }, Scalar::Byte(v))
+                if enum_type.ascii_str() == Some("None") =>
+            {
+                out.push(*v)
+            }
+            (TagExtra::Byte { .. }, Scalar::Byte(_)) => {
+                return Err(EditError::UnsupportedPropertyType {
+                    property,
+                    declared: format!("{declared} (enum-labelled)"),
+                });
+            }
+            _ => return Err(mismatch()),
+        },
+        "IntProperty" => match value {
+            Scalar::Int(v) => out.extend_from_slice(&v.to_le_bytes()),
+            _ => return Err(mismatch()),
+        },
+        "Int64Property" => match value {
+            Scalar::Int64(v) => out.extend_from_slice(&v.to_le_bytes()),
+            _ => return Err(mismatch()),
+        },
+        "FloatProperty" => match value {
+            Scalar::Float(v) => out.extend_from_slice(&v.to_le_bytes()),
+            _ => return Err(mismatch()),
+        },
+        "StrProperty" | "NameProperty" => match value {
+            Scalar::Text(v) => write_fstring(&mut out, &encode_text(v)),
+            _ => return Err(mismatch()),
+        },
+        // BoolProperty stores its value in the tag (size == 0), so it needs a
+        // different splice entirely. See the enum's doc comment.
+        _ => {
+            return Err(EditError::UnsupportedPropertyType { property, declared });
+        }
+    }
+    Ok(out)
+}
+
+/// ASCII uses the 1-byte-per-char form, anything else UTF-16LE; both carry the null
+/// terminator the format counts in its length field. Mirrors `FString`'s own
+/// round-trip rules in `gvas::primitives`.
+fn encode_text(text: &str) -> FString {
+    if text.is_empty() {
+        FString::Empty
+    } else if text.is_ascii() {
+        FString::Ascii {
+            content: text.as_bytes().to_vec(),
+            trailing: vec![0],
+        }
+    } else {
+        FString::Utf16 {
+            content: text.encode_utf16().collect(),
+            trailing: vec![0, 0],
+        }
+    }
 }
 
 /// Structural verification for an edited buffer, to be run before handing bytes back

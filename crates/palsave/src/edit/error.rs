@@ -27,6 +27,22 @@ pub enum EditError {
         old_size: u32,
         delta: i64,
     },
+    /// The scalar handed in doesn't match the property's declared tag type — e.g. a
+    /// string for a `ByteProperty`. Refused rather than coerced: writing four bytes
+    /// where the format expects one is silent corruption.
+    TypeMismatch {
+        property: String,
+        declared: String,
+        given: &'static str,
+    },
+    /// A property type this crate can't encode a value for yet. `BoolProperty` is
+    /// the notable one — its value lives in the *tag*, so editing it is a different
+    /// splice against a different offset, and half-supporting it would be worse than
+    /// refusing.
+    UnsupportedPropertyType {
+        property: String,
+        declared: String,
+    },
     /// The edited buffer didn't re-parse into an exact partition of itself, meaning
     /// some `size` field disagrees with the real byte layout. The buffer is not
     /// returned; see `edit::verify_reparses`.
@@ -69,6 +85,18 @@ impl fmt::Display for EditError {
                     "size fixup at offset {offset} ({old_size} + {delta}) is out of u32 range"
                 )
             }
+            EditError::TypeMismatch {
+                property,
+                declared,
+                given,
+            } => write!(
+                f,
+                "{property} is a {declared}; cannot write a {given} into it"
+            ),
+            EditError::UnsupportedPropertyType { property, declared } => write!(
+                f,
+                "{property} is a {declared}, which this editor cannot write yet"
+            ),
             EditError::VerificationFailed => {
                 write!(
                     f,

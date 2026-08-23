@@ -82,6 +82,17 @@ async function handleRequest(req: Request): Promise<{ value: unknown; transfer: 
       return { value: requireHandle().attachedPlayers(), transfer: [] };
     case 'playerInventory':
       return { value: requireHandle().playerInventory(req.uid), transfer: [] };
+    case 'diagnosticReport':
+      return { value: requireHandle().diagnosticReport(), transfer: [] };
+    case 'setPalStat':
+      requireHandle().setPalStat(req.instanceId, req.stat, req.value);
+      return { value: null, transfer: [] };
+    case 'setPalNickname':
+      requireHandle().setPalNickname(req.instanceId, req.nickname);
+      return { value: null, transfer: [] };
+    case 'setPlayerStat':
+      requireHandle().setPlayerStat(req.uid, req.stat, req.value);
+      return { value: null, transfer: [] };
     case 'diagnostics':
       return { value: requireHandle().diagnostics(), transfer: [] };
     case 'export': {
