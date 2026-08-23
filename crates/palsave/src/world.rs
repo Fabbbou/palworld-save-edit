@@ -139,3 +139,71 @@ impl WorldMap<'_> {
         [&self.world_entry, &self.map_entry, leaf]
     }
 }
+
+/// The array counterpart of [`WorldMap`]. `DynamicItemSaveData` is an `ArrayProperty`
+/// rather than a `MapProperty`, so `open_map` rejects it by construction.
+pub struct WorldArray<'a> {
+    /// The top-level `worldSaveData` property. Ancestor chain, element 0.
+    pub world_entry: PropertyEntry,
+    /// The named array property. Ancestor chain, element 1.
+    pub array_entry: PropertyEntry,
+    /// One property list per element. Elements that aren't property lists are skipped,
+    /// matching `open_map`'s fail-soft posture.
+    pub elements: Vec<Vec<PropertyEntry>>,
+    /// Scoped to `worldSaveData.<Name>`.
+    pub cursor: Cursor<'a>,
+}
+
+impl WorldArray<'_> {
+    /// `[worldSaveData, <array>, <leaf>]`. Note this chain omits the per-element
+    /// struct, which is correct only because array elements carry no `size` field of
+    /// their own — see `crate::edit`'s module docs on which sizes need fixing.
+    pub fn edit_chain<'e>(&'e self, leaf: &'e PropertyEntry) -> [&'e PropertyEntry; 3] {
+        [&self.world_entry, &self.array_entry, leaf]
+    }
+}
+
+/// Walks `worldSaveData.<array_name>` and materializes its elements.
+pub fn open_array<'a>(gvas: &'a [u8], array_name: &str) -> Result<WorldArray<'a>, WorldError> {
+    let file = GvasFile::parse(gvas)?;
+    let root = Cursor::new(gvas, &file.header);
+
+    let world_idx = file
+        .properties
+        .iter()
+        .position(|p| p.name == "worldSaveData")
+        .ok_or(WorldError::NotALevelSave)?;
+    let world_entry = file.properties[world_idx].clone();
+
+    let world_value = file.materialize(world_idx)?;
+    let world_children = world_value
+        .as_properties()
+        .ok_or(WorldError::NotALevelSave)?;
+
+    let array_entry = find(world_children, array_name)
+        .ok_or_else(|| WorldError::MapNotFound {
+            name: array_name.to_string(),
+        })?
+        .clone();
+
+    let world_cursor = root.rebase(gvas, "worldSaveData");
+    let array_value = world_cursor.materialize(&array_entry)?;
+    let items = array_value
+        .as_array()
+        .ok_or_else(|| WorldError::MapNotFound {
+            name: array_name.to_string(),
+        })?;
+
+    let elements = items
+        .iter()
+        .filter_map(|item| item.as_properties().map(|fields| fields.to_vec()))
+        .collect();
+
+    let cursor = root.rebase(gvas, &format!("worldSaveData.{array_name}"));
+    Ok(WorldArray {
+        world_entry,
+        array_entry,
+        elements,
+        cursor,
+    })
+}

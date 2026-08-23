@@ -22,6 +22,7 @@ use crate::characters::{self, CharacterError, PalSummary};
 use crate::gvas::nav::{self, Cursor};
 use crate::gvas::primitives::Guid;
 use crate::gvas::{GvasError, GvasFile};
+use crate::rawdata::dynamic_item::{self, DynamicItem};
 use crate::rawdata::error::RawDataError;
 use crate::rawdata::{character_container, item_container};
 use crate::world::{self, WorldError};
@@ -30,6 +31,7 @@ use std::fmt;
 
 pub const ITEM_CONTAINER_MAP: &str = "ItemContainerSaveData";
 pub const PAL_CONTAINER_MAP: &str = "CharacterContainerSaveData";
+pub const DYNAMIC_ITEM_ARRAY: &str = "DynamicItemSaveData";
 
 /// The container kinds reachable from a player's `SaveData`, in the order a UI
 /// should show them. The `&str` is the property name under `InventoryInfo`.
@@ -175,6 +177,16 @@ pub struct SlotView {
     /// Item id as the game stores it, e.g. `Wood`. There is no display-name table in
     /// this project, so this is what the UI shows.
     pub static_id: Option<String>,
+    /// The fields below come from the slot's `DynamicItemSaveData` row, when it has
+    /// one. Most items don't: a stack of Wood carries an all-zero `DynamicId` because
+    /// there is nothing about one plank that differs from another. `None` therefore
+    /// means "no per-instance state", not "lookup failed".
+    pub durability: Option<f32>,
+    pub remaining_bullets: Option<i32>,
+    /// Loaded ammunition's item id. `None` also covers the game's `None` sentinel.
+    pub ammo_static_id: Option<String>,
+    /// Which Pal is inside, for eggs.
+    pub egg_character_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -334,6 +346,33 @@ fn index_by_container_id(map: &world::WorldMap<'_>) -> BTreeMap<Guid, usize> {
     index
 }
 
+/// Indexes `worldSaveData.DynamicItemSaveData` by the id an item slot references.
+///
+/// Fail-soft on purpose: a world whose dynamic-item array is missing or won't decode
+/// still shows its inventories, just without durability. Losing a decoration is not
+/// worth blanking the screen, and `player_inventory`'s own errors stay about the
+/// containers themselves.
+fn dynamic_item_index(level_gvas: &[u8]) -> BTreeMap<item_container::DynamicId, DynamicItem> {
+    let Ok(array) = world::open_array(level_gvas, DYNAMIC_ITEM_ARRAY) else {
+        return BTreeMap::new();
+    };
+    let mut out = BTreeMap::new();
+    for fields in &array.elements {
+        let Some(raw) = array
+            .cursor
+            .get_opt(fields, "RawData")
+            .and_then(|v| v.as_bytes().map(|b| b.to_vec()))
+        else {
+            continue;
+        };
+        let Ok(decoded) = dynamic_item::decode(&raw) else {
+            continue;
+        };
+        out.insert(decoded.id.clone(), decoded);
+    }
+    out
+}
+
 /// Joins a player's container ids against `Level.sav`'s item containers.
 pub fn player_inventory(
     level_gvas: &[u8],
@@ -344,6 +383,7 @@ pub fn player_inventory(
 
     let map = world::open_map(level_gvas, ITEM_CONTAINER_MAP)?;
     let index = index_by_container_id(&map);
+    let dynamic = dynamic_item_index(level_gvas);
 
     let mut containers = Vec::with_capacity(CONTAINER_KINDS.len());
 
@@ -398,10 +438,15 @@ pub fn player_inventory(
                     continue;
                 }
                 let static_id = decoded.item.static_id.display_lossy();
+                let state = dynamic.get(&decoded.item.dynamic_id);
                 slots.push(SlotView {
                     slot_index: decoded.slot_index,
                     count: decoded.count,
                     static_id: (!static_id.is_empty()).then_some(static_id),
+                    durability: state.and_then(|d| d.durability()),
+                    remaining_bullets: state.and_then(|d| d.remaining_bullets()),
+                    ammo_static_id: state.and_then(|d| d.ammo_static_id()),
+                    egg_character_id: state.and_then(|d| d.egg_character_id()),
                 });
             }
         }

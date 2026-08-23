@@ -1196,6 +1196,38 @@ fn inventory_slot_contents_are_plausible() {
         sorted.sort_unstable();
         assert_eq!(indices, sorted, "slots are not in slot_index order");
     }
+
+    // The dynamic-item join has to survive all the way into the view model, not just
+    // work in isolation — `dynamic_item_ids_resolve_or_are_zero` proves the keys match,
+    // this proves `player_inventory` actually attaches what it looked up.
+    let enriched: Vec<&inventory::SlotView> = inv
+        .containers
+        .iter()
+        .flat_map(|c| c.slots.iter())
+        .filter(|s| {
+            s.durability.is_some() || s.ammo_static_id.is_some() || s.egg_character_id.is_some()
+        })
+        .collect();
+    assert!(
+        !enriched.is_empty(),
+        "no slot carries any dynamic item state — the join is producing None everywhere"
+    );
+    for slot in &enriched {
+        if let Some(d) = slot.durability {
+            assert!(
+                d.is_finite() && (0.0..=100_000.0).contains(&d),
+                "implausible durability {d} on {:?}",
+                slot.static_id
+            );
+        }
+        // The `None` sentinel must have been filtered out, not shown as an item name.
+        assert_ne!(slot.ammo_static_id.as_deref(), Some("None"));
+    }
+    eprintln!(
+        "{} of {} occupied slots carry dynamic item state",
+        enriched.len(),
+        inv.containers.iter().map(|c| c.slots.len()).sum::<usize>()
+    );
 }
 
 /// The file-type guard: dropping two Level.sav files must fail clearly rather than
@@ -1386,7 +1418,7 @@ fn level_fixtures() -> Vec<PathBuf> {
 fn rawdata_decoders_round_trip_on_every_level_save() {
     use palsave::gvas::nav::find;
     use palsave::gvas::value::Value;
-    use palsave::rawdata::{character, character_container, group, item_container};
+    use palsave::rawdata::{character, character_container, dynamic_item, group, item_container};
 
     let levels = level_fixtures();
     if levels.is_empty() {
@@ -1529,8 +1561,29 @@ fn rawdata_decoders_round_trip_on_every_level_save() {
             }
         }
 
+        // Per-instance item state.
+        let array = palsave::world::open_array(gvas, "DynamicItemSaveData").unwrap();
+        let mut dynamic_items_checked = 0usize;
+        for fields in &array.elements {
+            let Some(rd) = find(fields, "RawData") else {
+                continue;
+            };
+            let Value::Bytes(blob) = array.cursor.materialize(rd).unwrap() else {
+                continue;
+            };
+            let decoded = dynamic_item::decode(&blob)
+                .unwrap_or_else(|e| panic!("{label}: dynamic_item::decode: {e}"));
+            assert_eq!(
+                dynamic_item::encode(&decoded),
+                blob,
+                "{label}: DynamicItem RawData round-trip differed"
+            );
+            dynamic_items_checked += 1;
+        }
+
         eprintln!(
-            "{label}: ok — {slots_checked} item slots, {pal_slots_checked} pal slots, \
+            "{label}: ok — {dynamic_items_checked} dynamic items, {slots_checked} item slots, \
+             {pal_slots_checked} pal slots, \
              {populated_base_ids} guild(s) with non-empty base_ids, {populated_role_perms} \
              with role_permissions"
         );
@@ -1703,6 +1756,177 @@ fn pal_storage_agrees_with_ownership() {
                 owned.len()
             );
         }
+    }
+}
+
+/// `DynamicItemSaveData` payload shapes must be unambiguous on real data.
+///
+/// The blob carries no item-type tag, so `dynamic_item` identifies a payload by
+/// requiring exactly one of its three shapes to consume the bytes to the byte. That is
+/// only sound if real blobs don't fit two shapes at once — the lengths *can* collide in
+/// principle (a `WithAmmo` with an 18-character ammo name is 42 bytes, and so is the
+/// shortest `Egg`).
+///
+/// So: assert no blob in any world is ambiguous, and report how many fall through to
+/// `Opaque`. A rising `Opaque` count on a future save is the signal that a fourth shape
+/// exists, and it shows up as a number here rather than as a wrong durability on screen.
+#[test]
+fn dynamic_item_shapes_are_unambiguous() {
+    use palsave::gvas::nav::find;
+    use palsave::gvas::value::Value;
+    use palsave::rawdata::dynamic_item::{self, DynamicItemPayload};
+
+    let levels = level_fixtures();
+    if levels.is_empty() {
+        eprintln!("no Level.sav fixtures found, skipping");
+        return;
+    }
+
+    for path in levels {
+        let container = palsave::container::decode(&std::fs::read(&path).unwrap()).unwrap();
+        let gvas = &container.gvas;
+        let label = path.display();
+
+        let array = palsave::world::open_array(gvas, "DynamicItemSaveData").unwrap();
+        let (mut durability, mut with_ammo, mut egg, mut opaque) = (0, 0, 0, 0);
+        let mut with_durability_value = 0usize;
+
+        for fields in &array.elements {
+            let Some(rd) = find(fields, "RawData") else {
+                continue;
+            };
+            let Value::Bytes(blob) = array.cursor.materialize(rd).unwrap() else {
+                continue;
+            };
+            let decoded = dynamic_item::decode(&blob).unwrap();
+            let name = decoded.static_id.display_lossy();
+
+            // Re-derive the payload region the same way `decode` does, so the
+            // ambiguity check sees exactly the bytes the classifier saw.
+            let mut pos = 32usize;
+            let _ = palsave::gvas::primitives::read_fstring(&blob, &mut pos).unwrap();
+            let matches = dynamic_item::matching_shape_count(&blob[pos..]);
+            assert!(
+                matches <= 1,
+                "{label}: {name} payload fits {matches} shapes at once — the exact-fit \
+                 classifier can no longer tell them apart"
+            );
+
+            match &decoded.payload {
+                DynamicItemPayload::Durability { .. } => durability += 1,
+                DynamicItemPayload::WithAmmo { .. } => with_ammo += 1,
+                DynamicItemPayload::Egg { .. } => egg += 1,
+                DynamicItemPayload::Opaque(_) => opaque += 1,
+            }
+            if decoded.durability().is_some_and(|d| d > 0.0) {
+                with_durability_value += 1;
+            }
+        }
+
+        eprintln!(
+            "{label}: {durability} durability, {with_ammo} with-ammo, {egg} egg, \
+             {opaque} opaque ({with_durability_value} with a non-zero durability)"
+        );
+
+        // If every blob went opaque the classifier is doing nothing and the round-trip
+        // test above would still pass, since Opaque round-trips perfectly.
+        assert!(
+            opaque < array.elements.len(),
+            "{label}: no dynamic item payload was recognized at all"
+        );
+    }
+}
+
+/// Every item slot's `DynamicId` either resolves or is the all-zero sentinel.
+///
+/// This is the check that separates "most items legitimately have no dynamic state"
+/// from "the join is broken and everything returns None". Both look identical on
+/// screen; only the third category — a non-zero id that resolves to nothing — tells
+/// them apart, and there must be none of it.
+#[test]
+fn dynamic_item_ids_resolve_or_are_zero() {
+    use palsave::gvas::nav::find;
+    use palsave::gvas::value::Value;
+    use palsave::rawdata::{dynamic_item, item_container};
+    use std::collections::BTreeSet;
+
+    let levels = level_fixtures();
+    if levels.is_empty() {
+        eprintln!("no Level.sav fixtures found, skipping");
+        return;
+    }
+
+    for path in levels {
+        let container = palsave::container::decode(&std::fs::read(&path).unwrap()).unwrap();
+        let gvas = &container.gvas;
+        let label = path.display();
+
+        let array = palsave::world::open_array(gvas, "DynamicItemSaveData").unwrap();
+        let known: BTreeSet<item_container::DynamicId> = array
+            .elements
+            .iter()
+            .filter_map(|fields| {
+                let rd = find(fields, "RawData")?;
+                let Value::Bytes(blob) = array.cursor.materialize(rd).ok()? else {
+                    return None;
+                };
+                dynamic_item::decode(&blob).ok().map(|d| d.id)
+            })
+            .collect();
+        assert!(!known.is_empty(), "{label}: no dynamic items decoded");
+
+        let map = palsave::world::open_map(gvas, "ItemContainerSaveData").unwrap();
+        let (mut zero, mut resolved, mut dangling) = (0usize, 0usize, 0usize);
+
+        for entry in &map.entries {
+            let Some(slots) = map
+                .cursor
+                .get_opt(&entry.fields, "Slots")
+                .and_then(|v| v.as_array().map(|a| a.to_vec()))
+            else {
+                continue;
+            };
+            for slot in &slots {
+                let Some(fields) = slot.as_properties() else {
+                    continue;
+                };
+                let Some(rd) = find(fields, "RawData") else {
+                    continue;
+                };
+                let Value::Bytes(blob) = map.cursor.materialize(rd).unwrap() else {
+                    continue;
+                };
+                let Ok(decoded) = item_container::decode_slot(&blob) else {
+                    continue;
+                };
+                if decoded.count <= 0 {
+                    continue;
+                }
+                let id = &decoded.item.dynamic_id;
+                if id.is_zero() {
+                    zero += 1;
+                } else if known.contains(id) {
+                    resolved += 1;
+                } else {
+                    dangling += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            dangling, 0,
+            "{label}: {dangling} occupied slot(s) reference a non-zero DynamicId that no \
+             DynamicItemSaveData row matches — the join key is wrong"
+        );
+        // Every dynamic item exists because some slot points at it, so a world with
+        // dynamic items must have slots that resolve. Zero here would mean the join
+        // silently produced nothing while every assertion above still passed.
+        assert!(
+            resolved > 0,
+            "{label}: not one occupied slot resolved to a dynamic item, though {} exist",
+            known.len()
+        );
+        eprintln!("{label}: {resolved} slots resolved, {zero} plain, {dangling} dangling");
     }
 }
 

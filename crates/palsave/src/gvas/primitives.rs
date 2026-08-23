@@ -86,6 +86,13 @@ pub fn write_i64_le(out: &mut Vec<u8>, v: i64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
+/// Round-trips every bit pattern, NaN payloads included — `to_bits`, not `to_le_bytes`
+/// via a float literal — because a RawData blob must re-encode byte-identically even
+/// when it holds a value no sane game would write.
+pub fn write_f32_le(out: &mut Vec<u8>, v: f32) {
+    write_u32_le(out, v.to_bits());
+}
+
 pub fn read_guid(buf: &[u8], pos: &mut usize) -> Result<Guid, GvasError> {
     need(buf, *pos, 16)?;
     let mut g = [0u8; 16];

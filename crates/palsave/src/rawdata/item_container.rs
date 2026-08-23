@@ -76,10 +76,24 @@ pub fn encode_container(data: &ItemContainer) -> Vec<u8> {
     out
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Identifies one *instance* of an item, as opposed to its kind. Joins a slot to its
+/// `worldSaveData.DynamicItemSaveData` row — see `rawdata::dynamic_item`.
+///
+/// Ordered so it can key a lookup map; the ordering is arbitrary but stable.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DynamicId {
     pub created_world_id: Guid,
     pub local_id_in_created_world: Guid,
+}
+
+impl DynamicId {
+    /// An all-zero id means "this item has no per-instance state" — the common case,
+    /// since a stack of Wood needs no durability row. Distinguishing it from a real id
+    /// that failed to resolve is what keeps a broken join from looking like normal data.
+    pub fn is_zero(&self) -> bool {
+        self.created_world_id.iter().all(|&b| b == 0)
+            && self.local_id_in_created_world.iter().all(|&b| b == 0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

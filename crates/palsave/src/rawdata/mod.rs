@@ -12,6 +12,7 @@
 
 pub mod character;
 pub mod character_container;
+pub mod dynamic_item;
 pub mod error;
 pub mod group;
 pub mod item_container;
