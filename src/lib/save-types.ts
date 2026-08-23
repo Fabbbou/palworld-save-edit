@@ -123,6 +123,36 @@ export interface PlayerDetail {
   pals: PalSummary[];
 }
 
+/** One occupied inventory slot. Empty slots are not listed. */
+export interface SlotView {
+  slot_index: number;
+  count: number;
+  /** Item id as the game stores it, e.g. `PalSphere`. There is no display-name
+   *  table in this project, so this is what gets shown. */
+  static_id: string | null;
+}
+
+export interface ContainerView {
+  kind: 'common' | 'essential' | 'weapon' | 'armor' | 'food' | 'drop_slot';
+  id: string;
+  /** Declared capacity. Larger than `slots.length`, which counts only occupied. */
+  slot_count: number;
+  slots: SlotView[];
+  /** The player's save named a container id that Level.sav has no entry for.
+   *  Normal for an unused kind — but also what a mismatched pair of files looks
+   *  like, so it is surfaced rather than hidden. */
+  missing: boolean;
+}
+
+/**
+ * A player's inventories, joined across two files: the ids come from their own
+ * `Players/<uid>.sav`, the contents from `Level.sav`.
+ */
+export interface PlayerInventory {
+  player_uid: string;
+  containers: ContainerView[];
+}
+
 export interface Diagnostics {
   engine_version: string;
   save_game_version: number;
@@ -150,6 +180,8 @@ export interface SaveError {
     | 'map_not_found'
     | 'player_not_found'
     | 'malformed_uid'
+    | 'not_a_player_save'
+    | 'player_save_not_attached'
     | 'guild_not_found'
     | 'not_a_named_guild'
     | 'malformed_guild_id'

@@ -70,6 +70,18 @@ async function handleRequest(req: Request): Promise<{ value: unknown; transfer: 
       return { value: requireHandle().player(req.uid), transfer: [] };
     case 'palsOf':
       return { value: requireHandle().palsOf(req.uid), transfer: [] };
+    case 'attachPlayerSave':
+      return {
+        value: requireHandle().attachPlayerSave(new Uint8Array(req.bytes)),
+        transfer: [],
+      };
+    case 'detachPlayerSave':
+      requireHandle().detachPlayerSave(req.uid);
+      return { value: null, transfer: [] };
+    case 'attachedPlayers':
+      return { value: requireHandle().attachedPlayers(), transfer: [] };
+    case 'playerInventory':
+      return { value: requireHandle().playerInventory(req.uid), transfer: [] };
     case 'diagnostics':
       return { value: requireHandle().diagnostics(), transfer: [] };
     case 'export': {

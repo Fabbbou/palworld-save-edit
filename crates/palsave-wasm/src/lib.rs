@@ -20,7 +20,9 @@
 use palsave::characters;
 use palsave::container::{self, Algorithm, Container};
 use palsave::guilds;
+use palsave::inventory;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use wasm_bindgen::prelude::*;
 
 /// Typed error carrying a stable machine-readable `code` alongside the human message.
@@ -44,6 +46,10 @@ fn guild_error(e: guilds::GuildError) -> JsValue {
 }
 
 fn character_error(e: characters::CharacterError) -> JsValue {
+    js_error(e.code(), e)
+}
+
+fn inventory_error(e: inventory::InventoryError) -> JsValue {
     js_error(e.code(), e)
 }
 
@@ -200,6 +206,28 @@ struct PlayerDetailView {
 }
 
 #[derive(Serialize)]
+struct SlotView {
+    slot_index: i32,
+    count: i32,
+    static_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ContainerView {
+    kind: &'static str,
+    id: String,
+    slot_count: i32,
+    slots: Vec<SlotView>,
+    missing: bool,
+}
+
+#[derive(Serialize)]
+struct PlayerInventoryView {
+    player_uid: String,
+    containers: Vec<ContainerView>,
+}
+
+#[derive(Serialize)]
 struct Diagnostics {
     engine_version: String,
     save_game_version: u32,
@@ -212,7 +240,14 @@ struct Diagnostics {
 
 #[wasm_bindgen]
 pub struct SaveHandle {
+    /// The primary save — normally `Level.sav`.
     container: Container,
+    /// Player saves attached alongside it, keyed by the uid read out of each file.
+    /// Needed because a player's container ids live in their own save, not the level
+    /// (see `palsave::inventory`). Each is tens of KB against the level's megabytes,
+    /// so holding a few is not a memory concern — but they are stored once, never
+    /// cloned per query.
+    players: BTreeMap<String, Container>,
 }
 
 #[wasm_bindgen]
@@ -222,7 +257,10 @@ pub fn open(bytes: &[u8]) -> Result<SaveHandle, JsValue> {
     // at the first read call.
     palsave::gvas::GvasFile::parse(&container.gvas)
         .map_err(|e| js_error("gvas_parse_failed", e))?;
-    Ok(SaveHandle { container })
+    Ok(SaveHandle {
+        container,
+        players: BTreeMap::new(),
+    })
 }
 
 #[wasm_bindgen]
@@ -315,6 +353,66 @@ impl SaveHandle {
         let pals = characters::pals_of(&self.container.gvas, uid).map_err(character_error)?;
         let views: Vec<PalSummaryView> = pals.iter().map(PalSummaryView::from).collect();
         to_js(&views)
+    }
+
+    /// Attaches a `Players/<uid>.sav` and returns the uid read *from the file*.
+    /// The caller doesn't get to say which player this is — a mislabelled file would
+    /// otherwise silently attribute one player's inventory to another.
+    #[wasm_bindgen(js_name = attachPlayerSave)]
+    pub fn attach_player_save(&mut self, bytes: &[u8]) -> Result<String, JsValue> {
+        let container =
+            container::decode(bytes).map_err(|e| js_error("container_decode_failed", e))?;
+        // Rejects a Level.sav (or anything without SaveData) before it's stored.
+        let uid = inventory::player_uid(&container.gvas).map_err(inventory_error)?;
+        self.players.insert(uid.clone(), container);
+        Ok(uid)
+    }
+
+    #[wasm_bindgen(js_name = detachPlayerSave)]
+    pub fn detach_player_save(&mut self, uid: &str) {
+        self.players.remove(uid);
+    }
+
+    #[wasm_bindgen(js_name = attachedPlayers)]
+    pub fn attached_players(&self) -> Result<JsValue, JsValue> {
+        let uids: Vec<&String> = self.players.keys().collect();
+        to_js(&uids)
+    }
+
+    #[wasm_bindgen(js_name = playerInventory)]
+    pub fn player_inventory(&self, uid: &str) -> Result<JsValue, JsValue> {
+        let player = self.players.get(uid).ok_or_else(|| {
+            js_error(
+                "player_save_not_attached",
+                format!("no player save attached for {uid}"),
+            )
+        })?;
+
+        let inv = inventory::player_inventory(&self.container.gvas, &player.gvas)
+            .map_err(inventory_error)?;
+
+        to_js(&PlayerInventoryView {
+            player_uid: inv.player_uid,
+            containers: inv
+                .containers
+                .iter()
+                .map(|c| ContainerView {
+                    kind: c.kind.as_str(),
+                    id: c.id.clone(),
+                    slot_count: c.slot_count,
+                    slots: c
+                        .slots
+                        .iter()
+                        .map(|s| SlotView {
+                            slot_index: s.slot_index,
+                            count: s.count,
+                            static_id: s.static_id.clone(),
+                        })
+                        .collect(),
+                    missing: c.missing,
+                })
+                .collect(),
+        })
     }
 
     #[wasm_bindgen]

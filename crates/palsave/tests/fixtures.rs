@@ -1068,3 +1068,152 @@ fn character_navigation_is_blob_relative() {
         }
     }
 }
+
+/// Locates the fixture's player save, if one was provided.
+fn player_fixture() -> Option<PathBuf> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/Players");
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+        let path = e.path();
+        path.extension().is_some_and(|x| x == "sav").then_some(path)
+    })
+}
+
+/// The two-file join: container ids come from the player's own save, and every one
+/// of them must resolve to a real entry in Level.sav's container map.
+#[test]
+fn player_inventory_resolves_containers_from_the_player_save() {
+    use palsave::inventory;
+
+    let level_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/Level.sav");
+    let Some(player_path) = player_fixture() else {
+        eprintln!("no player fixture found, skipping");
+        return;
+    };
+    if !level_path.exists() {
+        eprintln!("no Level.sav fixture found, skipping");
+        return;
+    }
+
+    let level = palsave::container::decode(&std::fs::read(&level_path).unwrap()).unwrap();
+    let player = palsave::container::decode(&std::fs::read(&player_path).unwrap()).unwrap();
+
+    // The uid must come from the player file itself and match its own filename.
+    let uid = inventory::player_uid(&player.gvas).unwrap();
+    let stem = player_path
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(uid, stem, "player uid should match the save's filename");
+
+    let inv = inventory::player_inventory(&level.gvas, &player.gvas).unwrap();
+    assert_eq!(inv.player_uid, uid);
+    assert!(
+        !inv.containers.is_empty(),
+        "player has no containers — the InventoryInfo lookup found nothing"
+    );
+
+    // Every id the player file named must exist in Level.sav. A `missing` container
+    // here would mean the two files disagree, which for a matched pair is a bug.
+    for container in &inv.containers {
+        assert!(
+            !container.missing,
+            "{:?} container {} named by the player save has no entry in Level.sav",
+            container.kind, container.id
+        );
+    }
+
+    // At least one container should actually hold something, or the join silently
+    // "worked" while returning nothing useful.
+    let occupied: usize = inv.containers.iter().map(|c| c.slots.len()).sum();
+    assert!(occupied > 0, "no occupied slots found across any container");
+
+    eprintln!(
+        "resolved {} containers, {occupied} occupied slots",
+        inv.containers.len()
+    );
+    for c in &inv.containers {
+        eprintln!("  {:?}: {}/{} slots", c.kind, c.slots.len(), c.slot_count);
+    }
+}
+
+/// The load-bearing check. A mis-joined guid or a wrong buffer still returns `Ok`
+/// with structurally valid-looking data — it's the *values* that give it away, so
+/// assert they're plausible rather than merely present.
+#[test]
+fn inventory_slot_contents_are_plausible() {
+    use palsave::inventory;
+
+    let level_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/Level.sav");
+    let Some(player_path) = player_fixture() else {
+        eprintln!("no player fixture found, skipping");
+        return;
+    };
+    if !level_path.exists() {
+        return;
+    }
+
+    let level = palsave::container::decode(&std::fs::read(&level_path).unwrap()).unwrap();
+    let player = palsave::container::decode(&std::fs::read(&player_path).unwrap()).unwrap();
+    let inv = inventory::player_inventory(&level.gvas, &player.gvas).unwrap();
+
+    for container in &inv.containers {
+        assert!(
+            container.slot_count >= 0 && container.slot_count < 10_000,
+            "{:?}: implausible SlotNum {}",
+            container.kind,
+            container.slot_count
+        );
+        assert!(
+            container.slots.len() <= container.slot_count as usize,
+            "{:?}: {} occupied slots exceeds capacity {}",
+            container.kind,
+            container.slots.len(),
+            container.slot_count
+        );
+
+        for slot in &container.slots {
+            assert!(slot.count >= 1, "listed slot with count {}", slot.count);
+            assert!(
+                slot.slot_index >= 0 && slot.slot_index < container.slot_count,
+                "{:?}: slot_index {} outside 0..{}",
+                container.kind,
+                slot.slot_index,
+                container.slot_count
+            );
+            // Item ids are ASCII identifiers; a wrong-buffer read would not be.
+            if let Some(id) = &slot.static_id {
+                assert!(
+                    !id.is_empty() && id.chars().all(|c| c.is_ascii_graphic()),
+                    "implausible item id {id:?} — reading from the wrong buffer?"
+                );
+            }
+        }
+
+        // Slots must be listed in slot order for a stable UI.
+        let indices: Vec<i32> = container.slots.iter().map(|s| s.slot_index).collect();
+        let mut sorted = indices.clone();
+        sorted.sort_unstable();
+        assert_eq!(indices, sorted, "slots are not in slot_index order");
+    }
+}
+
+/// The file-type guard: dropping two Level.sav files must fail clearly rather than
+/// producing an empty inventory that looks like "you own nothing".
+#[test]
+fn a_level_save_is_rejected_as_a_player_save() {
+    use palsave::inventory;
+
+    let level_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/Level.sav");
+    if !level_path.exists() {
+        eprintln!("no Level.sav fixture found, skipping");
+        return;
+    }
+    let level = palsave::container::decode(&std::fs::read(&level_path).unwrap()).unwrap();
+
+    let err = inventory::player_uid(&level.gvas).unwrap_err();
+    assert_eq!(err.code(), "not_a_player_save");
+
+    let err = inventory::player_inventory(&level.gvas, &level.gvas).unwrap_err();
+    assert_eq!(err.code(), "not_a_player_save");
+}

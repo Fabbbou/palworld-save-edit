@@ -3,6 +3,7 @@
   import Inspector from './lib/components/Inspector.svelte';
   import Guilds from './lib/components/Guilds.svelte';
   import Players from './lib/components/Players.svelte';
+  import Inventory from './lib/components/Inventory.svelte';
   import { SaveClient } from './lib/worker/client';
   import type {
     Diagnostics,
@@ -21,20 +22,58 @@
   let diagnostics = $state<Diagnostics | null>(null);
   let guilds = $state<GuildSummary[]>([]);
   let players = $state<PlayerSummary[]>([]);
-  let tab = $state<'inspector' | 'players' | 'guilds'>('inspector');
+  let attachedPlayers = $state<string[]>([]);
+  let tab = $state<'inspector' | 'players' | 'inventory' | 'guilds'>('inspector');
   let busy = $state(false);
   let error = $state<SaveError | null>(null);
   let edited = $state(false);
   let exporting = $state(false);
 
-  async function openFile(file: File) {
+  const PLAYER_SAVE_CLASS = '/Script/Pal.PalWorldPlayerSaveGame';
+
+  /**
+   * Routes dropped files by what they actually are, not what they're called: each is
+   * probed with `open()` and identified by its save class. A file named Level.sav
+   * that is really a player save would otherwise be opened as the primary and every
+   * screen would come up empty.
+   *
+   * The primary is the first non-player save; player saves are attached alongside.
+   * Opening a player save on its own still works — it just becomes the primary and
+   * the level-only screens stay empty, which is the pre-existing behaviour.
+   */
+  async function openFiles(files: File[]) {
     busy = true;
     error = null;
     try {
-      const bytes = await file.arrayBuffer();
-      summary = await client.open(bytes); // transfers `bytes`; it's detached after this
-      fileName = file.name;
+      const probed = await Promise.all(
+        files.map(async (file) => ({ file, bytes: await file.arrayBuffer() })),
+      );
+
+      // Identify each without committing to one: open() replaces the handle, so the
+      // primary has to be chosen before anything is attached.
+      const classified: { file: File; bytes: ArrayBuffer; isPlayer: boolean }[] = [];
+      for (const { file, bytes } of probed) {
+        // A copy per probe: open() transfers, and we may need these bytes again.
+        const probe = await client.open(bytes.slice(0));
+        classified.push({ file, bytes, isPlayer: probe.save_game_type === PLAYER_SAVE_CLASS });
+      }
+
+      const primary = classified.find((c) => !c.isPlayer) ?? classified[0];
+      summary = await client.open(primary.bytes);
+      fileName = primary.file.name;
       edited = false;
+
+      attachedPlayers = [];
+      for (const candidate of classified) {
+        if (candidate === primary || !candidate.isPlayer) continue;
+        try {
+          const uid = await client.attachPlayerSave(candidate.bytes);
+          attachedPlayers = [...attachedPlayers, uid];
+        } catch {
+          // One unreadable player save shouldn't stop the level from opening.
+        }
+      }
+
       diagnostics = await client.diagnostics();
       guilds = await loadGuilds();
       players = await loadPlayers();
@@ -43,6 +82,7 @@
       error = e as SaveError;
       summary = null;
       fileName = null;
+      attachedPlayers = [];
     } finally {
       busy = false;
     }
@@ -105,6 +145,7 @@
     diagnostics = null;
     guilds = [];
     players = [];
+    attachedPlayers = [];
     tab = 'inspector';
     fileName = null;
     edited = false;
@@ -126,7 +167,7 @@
   {/if}
 
   {#if !summary}
-    <Dropzone onfile={openFile} {busy} />
+    <Dropzone onfiles={openFiles} {busy} />
   {:else}
     <div class="filebar">
       <div>
@@ -163,6 +204,9 @@
       >
         Players {players.length > 0 ? `(${players.length})` : ''}
       </button>
+      <button class:active={tab === 'inventory'} onclick={() => (tab = 'inventory')}>
+        Inventory {attachedPlayers.length > 0 ? `(${attachedPlayers.length})` : ''}
+      </button>
       <button class:active={tab === 'guilds'} onclick={() => (tab = 'guilds')} disabled={guilds.length === 0}>
         Guilds {guilds.length > 0 ? `(${guilds.length})` : ''}
       </button>
@@ -172,6 +216,8 @@
       <Inspector {summary} {diagnostics} />
     {:else if tab === 'players'}
       <Players {client} {players} />
+    {:else if tab === 'inventory'}
+      <Inventory {client} {attachedPlayers} />
     {:else}
       <Guilds {client} {guilds} onedited={refreshAfterEdit} />
     {/if}

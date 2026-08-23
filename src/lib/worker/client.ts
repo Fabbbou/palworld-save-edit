@@ -86,6 +86,24 @@ export class SaveClient {
     return this.#send({ id: this.#id(), kind: 'palsOf', uid });
   }
 
+  /** Takes ownership of `bytes` — the caller's ArrayBuffer is detached. Returns the
+   *  uid read from the file itself, not one supplied by the caller. */
+  attachPlayerSave(bytes: ArrayBuffer) {
+    return this.#send({ id: this.#id(), kind: 'attachPlayerSave', bytes }, [bytes]);
+  }
+
+  detachPlayerSave(uid: string) {
+    return this.#send({ id: this.#id(), kind: 'detachPlayerSave', uid });
+  }
+
+  attachedPlayers() {
+    return this.#send({ id: this.#id(), kind: 'attachedPlayers' });
+  }
+
+  playerInventory(uid: string) {
+    return this.#send({ id: this.#id(), kind: 'playerInventory', uid });
+  }
+
   diagnostics() {
     return this.#send({ id: this.#id(), kind: 'diagnostics' });
   }

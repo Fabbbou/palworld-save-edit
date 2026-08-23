@@ -15,6 +15,7 @@ import type {
   GuildSummary,
   PalSummary,
   PlayerDetail,
+  PlayerInventory,
   PlayerSummary,
   SaveError,
   SaveSummary,
@@ -29,6 +30,10 @@ export type Request =
   | { id: number; kind: 'listPlayers' }
   | { id: number; kind: 'player'; uid: string }
   | { id: number; kind: 'palsOf'; uid: string }
+  | { id: number; kind: 'attachPlayerSave'; bytes: ArrayBuffer }
+  | { id: number; kind: 'detachPlayerSave'; uid: string }
+  | { id: number; kind: 'attachedPlayers' }
+  | { id: number; kind: 'playerInventory'; uid: string }
   | { id: number; kind: 'diagnostics' }
   | { id: number; kind: 'export' }
   | { id: number; kind: 'close' };
@@ -43,6 +48,10 @@ export interface ResultOf {
   listPlayers: PlayerSummary[];
   player: PlayerDetail;
   palsOf: PalSummary[];
+  attachPlayerSave: string;
+  detachPlayerSave: null;
+  attachedPlayers: string[];
+  playerInventory: PlayerInventory;
   diagnostics: Diagnostics;
   export: ArrayBuffer;
   close: null;

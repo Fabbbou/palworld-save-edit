@@ -8,9 +8,9 @@
 
 use palsave::container::{self, Algorithm, Container, Passes};
 use palsave::gvas::header::{GVAS_MAGIC, Header};
-use palsave::gvas::primitives::{FString, write_fstring, write_u32_le};
+use palsave::gvas::primitives::{FString, write_fstring, write_i32_le, write_u32_le};
 use palsave::gvas::property::{PropertyTag, TagExtra, none_terminator, write_property_tag};
-use palsave::rawdata::group;
+use palsave::rawdata::{group, item_container};
 use palsave_wasm::open;
 use wasm_bindgen_test::*;
 
@@ -125,6 +125,9 @@ const PLAYER_UID: [u8; 16] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0,
 ];
 const PLAYER_INSTANCE_ID: [u8; 16] = [0x77; 16];
+/// The container the synthetic player's InventoryInfo points at, and the key of the
+/// one entry in the synthetic level's ItemContainerSaveData. The join under test.
+const CONTAINER_ID: [u8; 16] = [0x42; 16];
 
 /// A `SaveParameter` property list for a player: the `IsPlayer` flag that classifies
 /// the entry, plus a couple of stats to prove values survive the crossing.
@@ -277,6 +280,252 @@ fn character_map_value() -> Vec<u8> {
     v
 }
 
+/// One `ItemContainerSaveData` entry holding a single occupied slot.
+fn item_container_map_value() -> Vec<u8> {
+    let mut v = Vec::new();
+    write_u32_le(&mut v, 0); // keys-to-remove count
+    write_u32_le(&mut v, 1); // entry count
+
+    // Key: { ID: Guid }
+    let mut key = Vec::new();
+    write_property_tag(
+        &mut key,
+        &PropertyTag {
+            name: ascii("ID"),
+            type_name: ascii("StructProperty"),
+            size: 16,
+            index: 0,
+            extra: TagExtra::Struct {
+                struct_type: ascii("Guid"),
+                guid: [0u8; 16],
+            },
+            guid: None,
+        },
+        true,
+    );
+    key.extend_from_slice(&CONTAINER_ID);
+    write_fstring(&mut key, &none_terminator());
+    v.extend_from_slice(&key);
+
+    // One slot body: a property list carrying the slot's RawData blob.
+    let slot_blob = item_container::encode_slot(&item_container::ItemContainerSlot {
+        slot_index: 0,
+        count: 5,
+        item: item_container::ItemId {
+            static_id: ascii("Wood"),
+            dynamic_id: item_container::DynamicId {
+                created_world_id: [0u8; 16],
+                local_id_in_created_world: [0u8; 16],
+            },
+        },
+        trailing_bytes: Vec::new(),
+    });
+    let slot_raw_value = {
+        let mut r = Vec::new();
+        write_u32_le(&mut r, slot_blob.len() as u32);
+        r.extend_from_slice(&slot_blob);
+        r
+    };
+    let mut slot_body = Vec::new();
+    write_property_tag(
+        &mut slot_body,
+        &PropertyTag {
+            name: ascii("RawData"),
+            type_name: ascii("ArrayProperty"),
+            size: slot_raw_value.len() as u32,
+            index: 0,
+            extra: TagExtra::Array {
+                inner_type: ascii("ByteProperty"),
+            },
+            guid: None,
+        },
+        true,
+    );
+    slot_body.extend_from_slice(&slot_raw_value);
+    write_fstring(&mut slot_body, &none_terminator());
+
+    // Slots: ArrayProperty<StructProperty>. The element tag is written once, before
+    // the bodies — and is present even for a zero-length array (see ADR-003.md).
+    let slots_value = {
+        let mut a = Vec::new();
+        write_u32_le(&mut a, 1); // element count
+        write_property_tag(
+            &mut a,
+            &PropertyTag {
+                name: ascii("Slots"),
+                type_name: ascii("StructProperty"),
+                size: slot_body.len() as u32,
+                index: 0,
+                extra: TagExtra::Struct {
+                    struct_type: ascii("PalItemSlotSaveData"),
+                    guid: [0u8; 16],
+                },
+                guid: None,
+            },
+            true,
+        );
+        a.extend_from_slice(&slot_body);
+        a
+    };
+
+    let mut value = Vec::new();
+    write_property_tag(
+        &mut value,
+        &PropertyTag {
+            name: ascii("Slots"),
+            type_name: ascii("ArrayProperty"),
+            size: slots_value.len() as u32,
+            index: 0,
+            extra: TagExtra::Array {
+                inner_type: ascii("StructProperty"),
+            },
+            guid: None,
+        },
+        true,
+    );
+    value.extend_from_slice(&slots_value);
+
+    write_property_tag(
+        &mut value,
+        &PropertyTag {
+            name: ascii("SlotNum"),
+            type_name: ascii("IntProperty"),
+            size: 4,
+            index: 0,
+            extra: TagExtra::None,
+            guid: None,
+        },
+        true,
+    );
+    write_i32_le(&mut value, 42);
+    write_fstring(&mut value, &none_terminator());
+    v.extend_from_slice(&value);
+
+    v
+}
+
+/// A `Players/<uid>.sav`: the save class that identifies it, plus the `SaveData`
+/// holding the player's uid and the container ids that make an inventory resolvable.
+fn synthetic_player_sav() -> Vec<u8> {
+    // InventoryInfo.CommonContainerId = { ID: Guid }
+    let mut container_id_value = Vec::new();
+    write_property_tag(
+        &mut container_id_value,
+        &PropertyTag {
+            name: ascii("ID"),
+            type_name: ascii("StructProperty"),
+            size: 16,
+            index: 0,
+            extra: TagExtra::Struct {
+                struct_type: ascii("Guid"),
+                guid: [0u8; 16],
+            },
+            guid: None,
+        },
+        true,
+    );
+    container_id_value.extend_from_slice(&CONTAINER_ID);
+    write_fstring(&mut container_id_value, &none_terminator());
+
+    let mut inventory_info = Vec::new();
+    write_property_tag(
+        &mut inventory_info,
+        &PropertyTag {
+            name: ascii("CommonContainerId"),
+            type_name: ascii("StructProperty"),
+            size: container_id_value.len() as u32,
+            index: 0,
+            extra: TagExtra::Struct {
+                struct_type: ascii("PalContainerId"),
+                guid: [0u8; 16],
+            },
+            guid: None,
+        },
+        true,
+    );
+    inventory_info.extend_from_slice(&container_id_value);
+    write_fstring(&mut inventory_info, &none_terminator());
+
+    let mut save_data = Vec::new();
+    write_property_tag(
+        &mut save_data,
+        &PropertyTag {
+            name: ascii("PlayerUId"),
+            type_name: ascii("StructProperty"),
+            size: 16,
+            index: 0,
+            extra: TagExtra::Struct {
+                struct_type: ascii("Guid"),
+                guid: [0u8; 16],
+            },
+            guid: None,
+        },
+        true,
+    );
+    save_data.extend_from_slice(&PLAYER_UID);
+    write_property_tag(
+        &mut save_data,
+        &PropertyTag {
+            name: ascii("InventoryInfo"),
+            type_name: ascii("StructProperty"),
+            size: inventory_info.len() as u32,
+            index: 0,
+            extra: TagExtra::Struct {
+                struct_type: ascii("PalPlayerInventoryInfo"),
+                guid: [0u8; 16],
+            },
+            guid: None,
+        },
+        true,
+    );
+    save_data.extend_from_slice(&inventory_info);
+    write_fstring(&mut save_data, &none_terminator());
+
+    let mut gvas = Vec::new();
+    player_header().write(&mut gvas);
+    write_fstring(&mut gvas, &ascii("/Script/Pal.PalWorldPlayerSaveGame"));
+    write_property_tag(
+        &mut gvas,
+        &PropertyTag {
+            name: ascii("SaveData"),
+            type_name: ascii("StructProperty"),
+            size: save_data.len() as u32,
+            index: 0,
+            extra: TagExtra::Struct {
+                struct_type: ascii("PalWorldPlayerSaveData"),
+                guid: [0u8; 16],
+            },
+            guid: None,
+        },
+        true,
+    );
+    gvas.extend_from_slice(&save_data);
+    write_fstring(&mut gvas, &none_terminator());
+
+    let template = Container {
+        algorithm: Algorithm::Zlib,
+        passes: Passes::One,
+        was_cnk_wrapped: false,
+        gvas: Vec::new(),
+    };
+    container::encode(&gvas, &template)
+}
+
+fn player_header() -> Header {
+    Header {
+        magic: GVAS_MAGIC,
+        save_game_version: 3,
+        package_version_ue4: 522,
+        package_version_ue5: Some(1009),
+        engine_version_major: 5,
+        engine_version_minor: 1,
+        engine_version_patch: 1,
+        engine_version_build: 0,
+        engine_version_branch: FString::Empty,
+        custom_version: Some((3, vec![])),
+    }
+}
+
 /// A minimal but structurally real Level.sav: header, `worldSaveData`, one
 /// `GroupSaveDataMap` entry and one `CharacterSaveParameterMap` entry. Built
 /// inner-to-outer so every `size` field is exact.
@@ -326,6 +575,24 @@ fn synthetic_sav() -> Vec<u8> {
             true,
         );
         v.extend_from_slice(&character_value);
+
+        let item_value = item_container_map_value();
+        write_property_tag(
+            &mut v,
+            &PropertyTag {
+                name: ascii("ItemContainerSaveData"),
+                type_name: ascii("MapProperty"),
+                size: item_value.len() as u32,
+                index: 0,
+                extra: TagExtra::Map {
+                    key_type: ascii("StructProperty"),
+                    value_type: ascii("StructProperty"),
+                },
+                guid: None,
+            },
+            true,
+        );
+        v.extend_from_slice(&item_value);
 
         write_fstring(&mut v, &none_terminator());
         v
@@ -492,6 +759,50 @@ fn players_and_pals_cross_the_boundary() {
     );
 }
 
+/// The two-file join across the boundary: attach a player save, then resolve their
+/// inventory out of the level.
+#[wasm_bindgen_test]
+fn attaching_a_player_save_resolves_their_inventory() {
+    let mut handle = open(&synthetic_sav()).expect("open level");
+
+    // The uid comes from the file, not from the caller.
+    let uid = handle
+        .attach_player_save(&synthetic_player_sav())
+        .expect("attachPlayerSave");
+    assert_eq!(uid, "00000000000000000000000000000001");
+
+    let attached = js_sys::Array::from(&handle.attached_players().unwrap());
+    assert_eq!(attached.length(), 1);
+
+    let inv = handle.player_inventory(&uid).expect("playerInventory");
+    assert_eq!(get(&inv, "player_uid").as_string().unwrap(), uid);
+
+    let containers = js_sys::Array::from(&get(&inv, "containers"));
+    assert_eq!(
+        containers.length(),
+        1,
+        "only CommonContainerId is populated"
+    );
+
+    let common = containers.get(0);
+    assert_eq!(get(&common, "kind").as_string().unwrap(), "common");
+    assert_eq!(get(&common, "slot_count").as_f64().unwrap(), 42.0);
+    assert!(!get(&common, "missing").as_bool().unwrap());
+
+    let slots = js_sys::Array::from(&get(&common, "slots"));
+    assert_eq!(slots.length(), 1);
+    let slot = slots.get(0);
+    assert_eq!(get(&slot, "static_id").as_string().unwrap(), "Wood");
+    assert_eq!(get(&slot, "count").as_f64().unwrap(), 5.0);
+
+    // Detaching really removes it.
+    handle.detach_player_save(&uid);
+    assert_eq!(
+        js_sys::Array::from(&handle.attached_players().unwrap()).length(),
+        0
+    );
+}
+
 #[wasm_bindgen_test]
 fn errors_cross_with_machine_readable_codes() {
     let Err(err) = open(b"not a save file at all") else {
@@ -516,6 +827,17 @@ fn errors_cross_with_machine_readable_codes() {
 
     let err = handle.player(&"0".repeat(32)).unwrap_err();
     assert_eq!(get(&err, "code").as_string().unwrap(), "player_not_found");
+
+    // A level save is not a player save, and the guard must say so rather than
+    // silently attaching it and reporting an empty inventory.
+    let err = handle.attach_player_save(&synthetic_sav()).unwrap_err();
+    assert_eq!(get(&err, "code").as_string().unwrap(), "not_a_player_save");
+
+    let err = handle.player_inventory(&"0".repeat(32)).unwrap_err();
+    assert_eq!(
+        get(&err, "code").as_string().unwrap(),
+        "player_save_not_attached"
+    );
 }
 
 #[wasm_bindgen_test]
