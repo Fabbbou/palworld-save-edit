@@ -7,7 +7,8 @@
 //! compression is the caller's business — see `crate::container`.
 
 use crate::edit::{self, EditError};
-use crate::gvas::primitives::{FString, Guid};
+use crate::gvas::nav::{guid_to_hex, hex_to_guid};
+use crate::gvas::primitives::FString;
 use crate::gvas::value::{StructValue, Value, materialize_property};
 use crate::gvas::{GvasError, GvasFile, PropertyEntry};
 use crate::rawdata::error::RawDataError;
@@ -88,29 +89,6 @@ impl fmt::Display for GuildError {
 }
 
 impl std::error::Error for GuildError {}
-
-/// A `Guid` rendered as 32 lowercase hex chars. Deliberately *not* dashed
-/// UUID form: Unreal's `FGuid` field order vs. RFC-4122 byte order is a
-/// well-known source of confusion, and this project never needs to interoperate
-/// with an external UUID parser — it only needs a stable, reversible handle.
-pub fn guid_to_hex(guid: &Guid) -> String {
-    let mut s = String::with_capacity(32);
-    for byte in guid {
-        s.push_str(&format!("{byte:02x}"));
-    }
-    s
-}
-
-pub fn hex_to_guid(hex: &str) -> Option<Guid> {
-    if hex.len() != 32 {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for (i, slot) in out.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
-}
 
 /// Small view model: what a guild list needs, and nothing proportional to save size.
 #[derive(Debug, Clone, PartialEq)]
@@ -406,23 +384,9 @@ fn encode_name(name: &str) -> FString {
 mod tests {
     use super::*;
 
-    #[test]
-    fn guid_hex_round_trips() {
-        // Obviously-synthetic: test data, not a GUID lifted from a real save.
-        let guid: Guid = [
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
-            0xee, 0xff,
-        ];
-        let hex = guid_to_hex(&guid);
-        assert_eq!(hex, "00112233445566778899aabbccddeeff");
-        assert_eq!(hex_to_guid(&hex), Some(guid));
-    }
-
-    #[test]
-    fn malformed_hex_is_rejected() {
-        assert_eq!(hex_to_guid("too short"), None);
-        assert_eq!(hex_to_guid(&"z".repeat(32)), None);
-    }
+    // guid_to_hex / hex_to_guid live in `gvas::nav` and are tested there. This module
+    // used to carry its own copy whose test asserted raw byte order — which is what
+    // kept the formatter wrong while every test stayed green. Do not reintroduce one.
 
     #[test]
     fn encode_name_picks_the_right_fstring_form() {

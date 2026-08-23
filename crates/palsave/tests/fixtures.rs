@@ -1362,3 +1362,212 @@ fn out_of_range_and_missing_fields_are_refused() {
         assert_eq!(err.code(), "field_not_present");
     }
 }
+
+/// Every `Level.sav` under `fixtures/`, at any depth. Most tests here are pinned to
+/// one save because they assert exact counts; this exists for the checks that should
+/// hold for *any* world.
+fn level_fixtures() -> Vec<PathBuf> {
+    fixture_paths()
+        .into_iter()
+        .filter(|p| p.file_name().is_some_and(|n| n == "Level.sav"))
+        .collect()
+}
+
+/// Runs all three RawData decoders over every world available, asserting each blob
+/// re-encodes byte-identically.
+///
+/// The single-fixture tests above prove the decoders work on *one* world. That world
+/// happened to have `base_ids`, `guild_markers`, `role_permissions` and
+/// `guild_chest_allowed_roles` all empty, so those element encoders were exercised
+/// only by synthetic tests — a wrong element size would have round-tripped an empty
+/// list perfectly and corrupted a populated one. This is the test that would catch
+/// that, and it only has teeth when a second world is present.
+#[test]
+fn rawdata_decoders_round_trip_on_every_level_save() {
+    use palsave::gvas::nav::find;
+    use palsave::gvas::value::Value;
+    use palsave::rawdata::{character, group, item_container};
+
+    let levels = level_fixtures();
+    if levels.is_empty() {
+        eprintln!("no Level.sav fixtures found, skipping");
+        return;
+    }
+
+    for path in levels {
+        let container = palsave::container::decode(&std::fs::read(&path).unwrap())
+            .unwrap_or_else(|e| panic!("decode {path:?}: {e}"));
+        let gvas = &container.gvas;
+        let label = path.display();
+
+        // Guilds and organizations.
+        let map = palsave::world::open_map(gvas, "GroupSaveDataMap").unwrap();
+        let mut populated_base_ids = 0usize;
+        let mut populated_role_perms = 0usize;
+        for entry in &map.entries {
+            let (Some(gt), Some(rd)) = (
+                find(&entry.fields, "GroupType"),
+                find(&entry.fields, "RawData"),
+            ) else {
+                continue;
+            };
+            let Value::Enum(gt) = map.cursor.materialize(gt).unwrap() else {
+                continue;
+            };
+            let gt = gt.display_lossy();
+            let Value::Bytes(blob) = map.cursor.materialize(rd).unwrap() else {
+                continue;
+            };
+
+            let decoded = group::decode(&blob, &gt)
+                .unwrap_or_else(|e| panic!("{label}: group::decode ({gt}): {e}"));
+            assert_eq!(
+                group::encode(&decoded),
+                blob,
+                "{label}: group RawData round-trip differed for {gt}"
+            );
+
+            if let group::GroupVariant::Guild(g) = &decoded.data {
+                if !g.base_ids.is_empty() {
+                    populated_base_ids += 1;
+                }
+                if let group::GuildTail::PostUpdate(t) = &g.tail
+                    && !t.role_permissions.is_empty()
+                {
+                    populated_role_perms += 1;
+                }
+            }
+        }
+
+        // Characters.
+        let map = palsave::world::open_map(gvas, "CharacterSaveParameterMap").unwrap();
+        let hpg = map.cursor.has_property_guid();
+        for entry in &map.entries {
+            let Some(rd) = find(&entry.fields, "RawData") else {
+                continue;
+            };
+            let Value::Bytes(blob) = map.cursor.materialize(rd).unwrap() else {
+                continue;
+            };
+            let decoded = character::decode(&blob, hpg)
+                .unwrap_or_else(|e| panic!("{label}: character::decode: {e}"));
+            assert_eq!(
+                character::encode(&blob, &decoded),
+                blob,
+                "{label}: character RawData round-trip differed"
+            );
+        }
+
+        // Item containers and their slots.
+        let map = palsave::world::open_map(gvas, "ItemContainerSaveData").unwrap();
+        let mut slots_checked = 0usize;
+        for entry in &map.entries {
+            if let Some(rd) = find(&entry.fields, "RawData")
+                && let Value::Bytes(blob) = map.cursor.materialize(rd).unwrap()
+            {
+                let decoded = item_container::decode_container(&blob)
+                    .unwrap_or_else(|e| panic!("{label}: decode_container: {e}"));
+                assert_eq!(item_container::encode_container(&decoded), blob);
+            }
+            let Some(slots) = map
+                .cursor
+                .get_opt(&entry.fields, "Slots")
+                .and_then(|v| v.as_array().map(|a| a.to_vec()))
+            else {
+                continue;
+            };
+            for slot in &slots {
+                let Some(fields) = slot.as_properties() else {
+                    continue;
+                };
+                let Some(rd) = find(fields, "RawData") else {
+                    continue;
+                };
+                let Value::Bytes(blob) = map.cursor.materialize(rd).unwrap() else {
+                    continue;
+                };
+                let decoded = item_container::decode_slot(&blob)
+                    .unwrap_or_else(|e| panic!("{label}: decode_slot: {e}"));
+                assert_eq!(item_container::encode_slot(&decoded), blob);
+                slots_checked += 1;
+            }
+        }
+
+        eprintln!(
+            "{label}: ok — {slots_checked} slots, {populated_base_ids} guild(s) with \
+             non-empty base_ids, {populated_role_perms} with role_permissions"
+        );
+    }
+}
+
+/// Guild members and players must agree on what a uid looks like.
+///
+/// They did not. `guilds.rs` carried its own copy of `guid_to_hex` that was never
+/// updated when `nav::guid_to_hex` moved to Unreal's display convention, so the same
+/// player appeared as `…01000000` on the Guilds screen and `…00000001` on the Players
+/// screen. Every existing test passed: they compared *counts*, never the ids
+/// themselves, and guild ids are opaque handles that stayed self-consistent.
+///
+/// This is the check that fails when the two formatters drift apart again.
+#[test]
+fn guild_member_uids_agree_with_players_and_save_filenames() {
+    use palsave::{characters, guilds};
+
+    for level in level_fixtures() {
+        let container = palsave::container::decode(&std::fs::read(&level).unwrap()).unwrap();
+        let gvas = &container.gvas;
+
+        let player_uids: Vec<String> = characters::list_players(gvas)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.uid)
+            .collect();
+        if player_uids.is_empty() {
+            continue;
+        }
+
+        for summary in guilds::list(gvas).unwrap() {
+            if summary.group_type != palsave::rawdata::group::GUILD {
+                continue;
+            }
+            let detail = guilds::detail(gvas, &summary.id).unwrap();
+
+            for member in &detail.members {
+                assert!(
+                    player_uids.contains(&member.player_uid),
+                    "{}: guild member {} is not among the players {player_uids:?} — the two \
+                     layers disagree about uid formatting",
+                    level.display(),
+                    member.player_uid
+                );
+            }
+            if let Some(admin) = &detail.admin_player_uid {
+                assert!(
+                    player_uids.contains(admin),
+                    "{}: guild admin {admin} is not among the players {player_uids:?}",
+                    level.display()
+                );
+            }
+        }
+
+        // And the uid really is the player's own save filename.
+        let players_dir = level.parent().unwrap().join("Players");
+        if let Ok(entries) = std::fs::read_dir(&players_dir) {
+            let stems: Vec<String> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "sav"))
+                .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_lowercase()))
+                // `<uid>_dps.sav` is the separate Pal-storage save, not a player file.
+                .filter(|s| !s.ends_with("_dps"))
+                .collect();
+            for uid in &player_uids {
+                assert!(
+                    stems.contains(&uid.to_lowercase()),
+                    "{}: player uid {uid} matches no Players/*.sav filename {stems:?}",
+                    level.display()
+                );
+            }
+        }
+    }
+}
