@@ -84,6 +84,21 @@ async function handleRequest(req: Request): Promise<{ value: unknown; transfer: 
       return { value: requireHandle().playerInventory(req.uid), transfer: [] };
     case 'playerPalStorage':
       return { value: requireHandle().playerPalStorage(req.uid), transfer: [] };
+    case 'attachSourceWorld':
+      requireHandle().attachSourceWorld(new Uint8Array(req.bytes));
+      return { value: null, transfer: [] };
+    case 'attachSourcePlayer':
+      return {
+        value: requireHandle().attachSourcePlayer(new Uint8Array(req.bytes)),
+        transfer: [],
+      };
+    case 'sourcePlayers':
+      return { value: requireHandle().sourcePlayers(), transfer: [] };
+    case 'clearSource':
+      requireHandle().clearSource();
+      return { value: null, transfer: [] };
+    case 'migrationPlan':
+      return { value: requireHandle().migrationPlan(req.uid), transfer: [] };
     case 'diagnosticReport':
       return { value: requireHandle().diagnosticReport(), transfer: [] };
     case 'setPalStat':

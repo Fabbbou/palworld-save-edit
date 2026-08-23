@@ -4,6 +4,7 @@
   import Guilds from './lib/components/Guilds.svelte';
   import Players from './lib/components/Players.svelte';
   import Inventory from './lib/components/Inventory.svelte';
+  import Migrate from './lib/components/Migrate.svelte';
   import { SaveClient } from './lib/worker/client';
   import type {
     Diagnostics,
@@ -23,7 +24,9 @@
   let guilds = $state<GuildSummary[]>([]);
   let players = $state<PlayerSummary[]>([]);
   let attachedPlayers = $state<string[]>([]);
-  let tab = $state<'inspector' | 'players' | 'inventory' | 'guilds'>('inspector');
+  let tab = $state<'inspector' | 'players' | 'inventory' | 'guilds' | 'migrate'>(
+    'inspector',
+  );
   let busy = $state(false);
   let error = $state<SaveError | null>(null);
   let edited = $state(false);
@@ -247,6 +250,9 @@
       <button class:active={tab === 'inventory'} onclick={() => (tab = 'inventory')} data-testid="tab-inventory">
         Pals &amp; items {attachedPlayers.length > 0 ? `(${attachedPlayers.length})` : ''}
       </button>
+      <button class:active={tab === 'migrate'} onclick={() => (tab = 'migrate')} data-testid="tab-migrate">
+        Migrate
+      </button>
       <button class:active={tab === 'guilds'} onclick={() => (tab = 'guilds')} disabled={guilds.length === 0} data-testid="tab-guilds">
         Guilds {guilds.length > 0 ? `(${guilds.length})` : ''}
       </button>
@@ -258,6 +264,8 @@
       <Players {client} {players} onedited={refreshAfterEdit} />
     {:else if tab === 'inventory'}
       <Inventory {client} {attachedPlayers} />
+    {:else if tab === 'migrate'}
+      <Migrate {client} />
     {:else}
       <Guilds {client} {guilds} onedited={refreshAfterEdit} />
     {/if}

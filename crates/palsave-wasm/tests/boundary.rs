@@ -246,6 +246,89 @@ fn pal_storage_without_an_attached_player_save_is_refused() {
     );
 }
 
+/// The migration survey across the boundary, between two synthetic worlds.
+///
+/// WORLD_B shares WORLD_A's Pal instance id on purpose — that is the real behaviour
+/// found in the fixture corpus, where two unrelated worlds turned out to contain the
+/// same instance id. Without the overlap this test would pass against a survey that
+/// detects nothing.
+#[wasm_bindgen_test]
+fn migration_plan_crosses_the_boundary_and_reports_collisions() {
+    use palsave::synthetic::{WORLD_B, synthetic_player_sav_for, synthetic_sav_for};
+
+    // Destination is the open save; source is attached alongside it.
+    let mut handle = open(&synthetic_sav()).expect("open destination");
+
+    // Asking before attaching a source is refused, not answered with an empty plan.
+    let err = handle.migration_plan("whatever").unwrap_err();
+    assert_eq!(get(&err, "code").as_string().unwrap(), "no_source_world");
+
+    handle
+        .attach_source_world(&synthetic_sav_for(&WORLD_B))
+        .expect("attachSourceWorld");
+
+    let listed = js_sys::Array::from(&handle.source_players().unwrap());
+    assert_eq!(listed.length(), 1);
+    let uid = listed.get(0).as_string().unwrap();
+    assert_eq!(uid, "00000000000000000000000000000002");
+
+    // The source player's own save is still required — container ids live there.
+    let err = handle.migration_plan(&uid).unwrap_err();
+    assert_eq!(
+        get(&err, "code").as_string().unwrap(),
+        "player_save_not_attached"
+    );
+
+    let attached = handle
+        .attach_source_player(&synthetic_player_sav_for(&WORLD_B))
+        .expect("attachSourcePlayer");
+    assert_eq!(attached, uid);
+
+    let plan = handle.migration_plan(&uid).expect("migrationPlan");
+    assert_eq!(get(&plan, "player_uid").as_string().unwrap(), uid);
+    assert_eq!(get(&plan, "pal_count").as_f64().unwrap(), 1.0);
+    assert_eq!(get(&plan, "item_container_count").as_f64().unwrap(), 1.0);
+    assert_eq!(get(&plan, "pal_container_count").as_f64().unwrap(), 2.0);
+    assert_eq!(get(&plan, "dynamic_item_count").as_f64().unwrap(), 1.0);
+    // The player, their Pal, one item container, two Pal containers, one dynamic item.
+    assert_eq!(get(&plan, "row_count").as_f64().unwrap(), 6.0);
+
+    // WORLD_B's player uid differs from WORLD_A's, so the *only* blocking collision
+    // should be the deliberately shared Pal instance id.
+    assert_eq!(get(&plan, "blocking_count").as_f64().unwrap(), 1.0);
+    let conflicts = js_sys::Array::from(&get(&plan, "conflicts"));
+    let codes: Vec<String> = (0..conflicts.length())
+        .map(|i| get(&conflicts.get(i), "code").as_string().unwrap())
+        .collect();
+    assert!(codes.contains(&"pal_instance_exists".to_string()));
+    // The guilds differ too, so the migrated player's guild goes dangling.
+    assert!(codes.contains(&"guild_missing".to_string()));
+    assert!(
+        !codes.contains(&"player_exists".to_string()),
+        "WORLD_B's player uid differs; a player collision here means uids are being \
+         compared wrongly"
+    );
+
+    // Dropping the source frees the second world and makes plans unavailable again.
+    handle.clear_source();
+    assert_eq!(
+        js_sys::Array::from(&handle.source_players().unwrap()).length(),
+        0
+    );
+    let err = handle.migration_plan(&uid).unwrap_err();
+    assert_eq!(get(&err, "code").as_string().unwrap(), "no_source_world");
+}
+
+/// A player save handed in where a world is expected must be refused clearly.
+#[wasm_bindgen_test]
+fn a_player_save_is_rejected_as_a_source_world() {
+    let mut handle = open(&synthetic_sav()).expect("open");
+    let err = handle
+        .attach_source_world(&synthetic_player_sav())
+        .unwrap_err();
+    assert_eq!(get(&err, "code").as_string().unwrap(), "not_a_level_save");
+}
+
 /// The diagnostic report is meant to be shareable, so its "no personal data" claim
 /// is enforced here rather than trusted. The synthetic save deliberately contains a
 /// player nickname, a guild name and a uid; none may appear in the report.

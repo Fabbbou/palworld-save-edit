@@ -186,6 +186,35 @@ export interface PlayerPalStorage {
   containers: PalContainerView[];
 }
 
+export interface ConflictView {
+  code:
+    | 'player_exists'
+    | 'pal_instance_exists'
+    | 'container_exists'
+    | 'dynamic_item_exists'
+    | 'guild_missing';
+  /** The colliding identity — a uid, an instance id, a container id. */
+  id: string;
+}
+
+/**
+ * What migrating a player into the open save would move, and what it would collide
+ * with. Read-only: asking for a plan never writes anything.
+ */
+export interface MigrationPlan {
+  player_uid: string;
+  pal_count: number;
+  item_container_count: number;
+  pal_container_count: number;
+  dynamic_item_count: number;
+  row_count: number;
+  source_group_id: string | null;
+  conflicts: ConflictView[];
+  /** Conflicts that would leave two things sharing an identity. `guild_missing` is a
+   *  dangling reference rather than a duplicate, so it isn't counted here. */
+  blocking_count: number;
+}
+
 /** Editable stats. Mirrors the string names `palsave-wasm` parses; an unknown one is
  *  refused there rather than defaulted. */
 export type PalStatName = 'level' | 'exp' | 'talent_hp' | 'talent_shot' | 'talent_defense';

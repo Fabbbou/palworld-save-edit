@@ -108,6 +108,31 @@ export class SaveClient {
     return this.#send({ id: this.#id(), kind: 'playerPalStorage', uid });
   }
 
+  /** The world a player would be migrated *from*. The open save is always the
+   *  destination, so direction never depends on argument order. Takes ownership of
+   *  `bytes`. */
+  attachSourceWorld(bytes: ArrayBuffer) {
+    return this.#send({ id: this.#id(), kind: 'attachSourceWorld', bytes }, [bytes]);
+  }
+
+  /** Takes ownership of `bytes`. Returns the uid read from the file. */
+  attachSourcePlayer(bytes: ArrayBuffer) {
+    return this.#send({ id: this.#id(), kind: 'attachSourcePlayer', bytes }, [bytes]);
+  }
+
+  sourcePlayers() {
+    return this.#send({ id: this.#id(), kind: 'sourcePlayers' });
+  }
+
+  /** Drops the second world, freeing its buffer. */
+  clearSource() {
+    return this.#send({ id: this.#id(), kind: 'clearSource' });
+  }
+
+  migrationPlan(uid: string) {
+    return this.#send({ id: this.#id(), kind: 'migrationPlan', uid });
+  }
+
   diagnosticReport() {
     return this.#send({ id: this.#id(), kind: 'diagnosticReport' });
   }

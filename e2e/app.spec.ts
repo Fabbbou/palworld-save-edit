@@ -10,6 +10,14 @@ import path from 'node:path';
 const FIXTURES = path.resolve(fileURLToPath(new URL('.', import.meta.url)), 'fixtures');
 const LEVEL = path.join(FIXTURES, 'Level.sav');
 const PLAYER = path.join(FIXTURES, 'Players', '00000000000000000000000000000001.sav');
+/** A second, unrelated world — see `synthetic::WORLD_B`. */
+const OTHER_LEVEL = path.join(FIXTURES, 'other', 'Level.sav');
+const OTHER_PLAYER = path.join(
+  FIXTURES,
+  'other',
+  'Players',
+  '00000000000000000000000000000002.sav',
+);
 
 /** Loading is async through a worker; the filebar appearing is the ready signal. */
 async function load(page: Page, files: string[]) {
@@ -111,6 +119,37 @@ test('dropping level + player together resolves the pal box', async ({ page }) =
   // The slot resolved all the way to a Pal, not just to an instance id.
   await expect(box.getByRole('cell', { name: 'Lamball' })).toBeVisible();
   await expect(box.getByRole('cell', { name: '70/?/?' })).toBeVisible();
+});
+
+test('migration preview reports rows and the collision', async ({ page }) => {
+  await load(page, [LEVEL]);
+  await page.getByTestId('tab-migrate').click();
+  await expect(page.getByTestId('migrate')).toBeVisible();
+
+  // Step 1: the world to migrate from.
+  await page.getByTestId('source-world-input').setInputFiles(OTHER_LEVEL);
+  await expect(page.getByTestId('source-loaded')).toContainText('1 player');
+
+  // Step 2: that player's own save, where their container ids live.
+  await page.getByTestId('source-player-input').setInputFiles(OTHER_PLAYER);
+
+  // Step 3: preview.
+  await page.getByTestId('preview-00000000000000000000000000000002').click();
+  const plan = page.getByTestId('migration-plan');
+  await expect(plan).toContainText('Would move 6 rows');
+
+  // WORLD_B shares WORLD_A's Pal instance id on purpose, so exactly one blocking
+  // collision is expected — and the guild is missing, which is reported but not
+  // counted as blocking.
+  await expect(plan).toContainText('1 blocking collision');
+  const conflicts = page.getByTestId('conflicts');
+  await expect(conflicts).toContainText('A Pal with this instance id is already here');
+  await expect(conflicts).toContainText('Their guild does not exist here');
+  await expect(conflicts).not.toContainText('A player with this uid');
+
+  // Forgetting the source really drops it.
+  await page.getByTestId('clear-source').click();
+  await expect(page.getByTestId('source-loaded')).toHaveCount(0);
 });
 
 test('export produces a non-empty download', async ({ page }) => {

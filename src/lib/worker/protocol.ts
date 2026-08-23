@@ -17,6 +17,7 @@ import type {
   PlayerDetail,
   PlayerInventory,
   PlayerPalStorage,
+  MigrationPlan,
   DiagnosticReport,
   PalStatName,
   PlayerStatName,
@@ -39,6 +40,11 @@ export type Request =
   | { id: number; kind: 'attachedPlayers' }
   | { id: number; kind: 'playerInventory'; uid: string }
   | { id: number; kind: 'playerPalStorage'; uid: string }
+  | { id: number; kind: 'attachSourceWorld'; bytes: ArrayBuffer }
+  | { id: number; kind: 'attachSourcePlayer'; bytes: ArrayBuffer }
+  | { id: number; kind: 'sourcePlayers' }
+  | { id: number; kind: 'clearSource' }
+  | { id: number; kind: 'migrationPlan'; uid: string }
   | { id: number; kind: 'diagnosticReport' }
   | { id: number; kind: 'setPalStat'; instanceId: string; stat: PalStatName; value: number }
   | { id: number; kind: 'setPalNickname'; instanceId: string; nickname: string }
@@ -62,6 +68,11 @@ export interface ResultOf {
   attachedPlayers: string[];
   playerInventory: PlayerInventory;
   playerPalStorage: PlayerPalStorage;
+  attachSourceWorld: null;
+  attachSourcePlayer: string;
+  sourcePlayers: string[];
+  clearSource: null;
+  migrationPlan: MigrationPlan;
   diagnosticReport: DiagnosticReport;
   setPalStat: null;
   setPalNickname: null;

@@ -24,10 +24,64 @@ use crate::gvas::primitives::{FString, write_fstring, write_i32_le, write_u32_le
 use crate::gvas::property::{PropertyTag, TagExtra, none_terminator, write_property_tag};
 use crate::rawdata::{character_container, dynamic_item, group, item_container};
 
-/// Obviously-synthetic: this is test data, not a GUID lifted from a real save.
-pub const GUILD_ID: [u8; 16] = [
-    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-];
+/// Every identity a synthetic world is built around, so a second, *different* world can
+/// be generated from the same builders.
+///
+/// A migration is a two-world question and cannot be tested against one world, however
+/// carefully built. Parameterising the ids is what makes the second world possible.
+#[derive(Debug, Clone, Copy)]
+pub struct WorldIds {
+    pub guild_id: [u8; 16],
+    pub player_uid: [u8; 16],
+    pub player_instance_id: [u8; 16],
+    pub pal_instance_id: [u8; 16],
+    pub container_id: [u8; 16],
+    pub pal_storage_container_id: [u8; 16],
+    pub pal_party_container_id: [u8; 16],
+    pub dynamic_item_local_id: [u8; 16],
+}
+
+/// The default world. All ids obviously-synthetic: test data, never lifted from a real
+/// save.
+pub const WORLD_A: WorldIds = WorldIds {
+    guild_id: [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ],
+    // Little-endian 1 in the final u32 group, so this renders as
+    // "00000000000000000000000000000001" — Palworld's own player-file naming.
+    player_uid: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0],
+    player_instance_id: [0x77; 16],
+    pal_instance_id: [0x55; 16],
+    container_id: [0x42; 16],
+    pal_storage_container_id: [0x43; 16],
+    pal_party_container_id: [0x44; 16],
+    dynamic_item_local_id: [0x66; 16],
+};
+
+/// A second, unrelated world — except for one deliberate overlap.
+///
+/// `pal_instance_id` is **the same as [`WORLD_A`]'s**, reproducing the real behaviour
+/// found in the fixture corpus: Pal instance ids are not globally unique, so two
+/// unrelated worlds can contain the same one. Without that overlap the collision path
+/// in `migrate` would have nothing to detect and its tests would pass vacuously.
+///
+/// The player uid deliberately *differs*, so a migration between these two isolates the
+/// Pal collision instead of drowning it in a player collision as well.
+pub const WORLD_B: WorldIds = WorldIds {
+    guild_id: [0xb1; 16],
+    player_uid: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0, 0],
+    player_instance_id: [0xb7; 16],
+    // Shared with WORLD_A on purpose. See above.
+    pal_instance_id: [0x55; 16],
+    container_id: [0xb2; 16],
+    pal_storage_container_id: [0xb3; 16],
+    pal_party_container_id: [0xb4; 16],
+    dynamic_item_local_id: [0xb6; 16],
+};
+
+/// Kept for tests written before worlds were parameterised.
+pub const GUILD_ID: [u8; 16] = WORLD_A.guild_id;
 
 pub fn ascii(s: &str) -> FString {
     FString::Ascii {
@@ -37,9 +91,9 @@ pub fn ascii(s: &str) -> FString {
 }
 
 /// One guild's RawData blob, in the current (`PostUpdate` tail) shape.
-fn guild_blob() -> Vec<u8> {
+fn guild_blob(ids: &WorldIds) -> Vec<u8> {
     group::encode(&group::GroupData {
-        group_id: GUILD_ID,
+        group_id: ids.guild_id,
         group_name: ascii("test-group"),
         individual_character_handle_ids: vec![group::CharacterHandle {
             guid: [1u8; 16],
@@ -73,7 +127,7 @@ fn guild_blob() -> Vec<u8> {
 }
 
 /// The `GroupSaveDataMap` entry value: a property list carrying GroupType + RawData.
-fn group_entry_value() -> Vec<u8> {
+fn group_entry_value(ids: &WorldIds) -> Vec<u8> {
     let mut out = Vec::new();
 
     let group_type_value = {
@@ -97,7 +151,7 @@ fn group_entry_value() -> Vec<u8> {
     );
     out.extend_from_slice(&group_type_value);
 
-    let blob = guild_blob();
+    let blob = guild_blob(ids);
     let raw_value = {
         let mut v = Vec::new();
         write_u32_le(&mut v, blob.len() as u32);
@@ -124,12 +178,8 @@ fn group_entry_value() -> Vec<u8> {
     out
 }
 
-pub const PLAYER_UID: [u8; 16] = [
-    // Little-endian 1 in the final u32 group, so this renders as
-    // "00000000000000000000000000000001" — Palworld's own player-file naming.
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0,
-];
-pub const PLAYER_INSTANCE_ID: [u8; 16] = [0x77; 16];
+pub const PLAYER_UID: [u8; 16] = WORLD_A.player_uid;
+pub const PLAYER_INSTANCE_ID: [u8; 16] = WORLD_A.player_instance_id;
 /// The container the synthetic player's InventoryInfo points at, and the key of the
 /// one entry in the synthetic level's ItemContainerSaveData. The join under test.
 pub const CONTAINER_ID: [u8; 16] = [0x42; 16];
@@ -203,7 +253,7 @@ fn player_save_parameter() -> Vec<u8> {
 
 /// The `PalCharacterData` RawData blob: a nested property list holding
 /// `SaveParameter`, then 4 unknown bytes, a group id, and 4 trailing bytes.
-fn player_raw_data() -> Vec<u8> {
+fn player_raw_data(ids: &WorldIds) -> Vec<u8> {
     let save_parameter = player_save_parameter();
 
     let mut object = Vec::new();
@@ -227,7 +277,7 @@ fn player_raw_data() -> Vec<u8> {
 
     let mut blob = object;
     blob.extend_from_slice(&[0, 0, 0, 0]); // unknown_bytes
-    blob.extend_from_slice(&GUILD_ID); // group_id
+    blob.extend_from_slice(&ids.guild_id); // group_id
     blob.extend_from_slice(&[0, 0, 0, 0]); // trailing_bytes
     blob
 }
@@ -236,7 +286,7 @@ fn player_raw_data() -> Vec<u8> {
 /// owner is what `characters::pals_of` reads, so a Pal built this way is reachable
 /// both through ownership and through the Pal box — the two paths
 /// `pal_storage_agrees_with_ownership` compares.
-fn pal_save_parameter() -> Vec<u8> {
+fn pal_save_parameter(ids: &WorldIds) -> Vec<u8> {
     let mut out = Vec::new();
 
     let character_id = {
@@ -305,14 +355,14 @@ fn pal_save_parameter() -> Vec<u8> {
         },
         true,
     );
-    out.extend_from_slice(&PLAYER_UID);
+    out.extend_from_slice(&ids.player_uid);
 
     write_fstring(&mut out, &none_terminator());
     out
 }
 
 /// Wraps a `SaveParameter` list into the `PalCharacterData` RawData blob shape.
-fn character_raw_data(save_parameter: Vec<u8>) -> Vec<u8> {
+fn character_raw_data(ids: &WorldIds, save_parameter: Vec<u8>) -> Vec<u8> {
     let mut object = Vec::new();
     write_property_tag(
         &mut object,
@@ -334,7 +384,7 @@ fn character_raw_data(save_parameter: Vec<u8>) -> Vec<u8> {
 
     let mut blob = object;
     blob.extend_from_slice(&[0, 0, 0, 0]); // unknown_bytes
-    blob.extend_from_slice(&GUILD_ID); // group_id
+    blob.extend_from_slice(&ids.guild_id); // group_id
     blob.extend_from_slice(&[0, 0, 0, 0]); // trailing_bytes
     blob
 }
@@ -401,21 +451,21 @@ fn character_map_entry(player_uid: [u8; 16], instance_id: [u8; 16], blob: Vec<u8
 /// A Pal is not optional decoration here. Without one the Pal-box join has nothing to
 /// resolve to, and a test asserting "the box is readable" would pass against a decoder
 /// that returns nothing.
-fn character_map_value() -> Vec<u8> {
+fn character_map_value(ids: &WorldIds) -> Vec<u8> {
     let mut v = Vec::new();
     write_u32_le(&mut v, 0); // keys-to-remove count
     write_u32_le(&mut v, 2); // entry count
 
     v.extend_from_slice(&character_map_entry(
-        PLAYER_UID,
-        PLAYER_INSTANCE_ID,
-        player_raw_data(),
+        ids.player_uid,
+        ids.player_instance_id,
+        player_raw_data(ids),
     ));
     // A Pal's map key carries a zero PlayerUId — ownership lives in the RawData.
     v.extend_from_slice(&character_map_entry(
         [0u8; 16],
-        PAL_INSTANCE_ID,
-        character_raw_data(pal_save_parameter()),
+        ids.pal_instance_id,
+        character_raw_data(ids, pal_save_parameter(ids)),
     ));
 
     v
@@ -426,12 +476,12 @@ fn character_map_value() -> Vec<u8> {
 /// The slot's `DynamicId` is non-zero and matches [`dynamic_item_array_value`], so the
 /// durability join has something to resolve. An all-zero id — the "no per-instance
 /// state" sentinel — would leave that path untested.
-fn item_container_map_value() -> Vec<u8> {
+fn item_container_map_value(ids: &WorldIds) -> Vec<u8> {
     let mut v = Vec::new();
     write_u32_le(&mut v, 0); // keys-to-remove count
     write_u32_le(&mut v, 1); // entry count
 
-    v.extend_from_slice(&container_key(CONTAINER_ID));
+    v.extend_from_slice(&container_key(ids.container_id));
 
     let slot_blob = item_container::encode_slot(&item_container::ItemContainerSlot {
         slot_index: 0,
@@ -440,7 +490,7 @@ fn item_container_map_value() -> Vec<u8> {
             static_id: ascii("ClothArmor"),
             dynamic_id: item_container::DynamicId {
                 created_world_id: [0u8; 16],
-                local_id_in_created_world: DYNAMIC_ITEM_LOCAL_ID,
+                local_id_in_created_world: ids.dynamic_item_local_id,
             },
         },
         trailing_bytes: Vec::new(),
@@ -568,17 +618,17 @@ fn container_value(slot_body: &[u8], struct_type: &str, slot_num: i32) -> Vec<u8
 /// `CharacterContainerSaveData`: the player's Pal box (holding the one Pal) and their
 /// party (empty capacity, so the "container resolves but is empty" path is exercised
 /// too).
-fn pal_container_map_value() -> Vec<u8> {
+fn pal_container_map_value(ids: &WorldIds) -> Vec<u8> {
     let mut v = Vec::new();
     write_u32_le(&mut v, 0); // keys-to-remove count
     write_u32_le(&mut v, 2); // entry count
 
     let occupied = character_container::encode_slot(&character_container::PalContainerSlot {
-        leading_bytes: PLAYER_UID,
-        instance_id: PAL_INSTANCE_ID,
+        leading_bytes: ids.player_uid,
+        instance_id: ids.pal_instance_id,
         trailing_bytes: vec![0; 6],
     });
-    v.extend_from_slice(&container_key(PAL_STORAGE_CONTAINER_ID));
+    v.extend_from_slice(&container_key(ids.pal_storage_container_id));
     v.extend_from_slice(&container_value(
         &raw_data_property(&occupied),
         "PalContainerCharacterSlotSaveData",
@@ -588,7 +638,7 @@ fn pal_container_map_value() -> Vec<u8> {
     // The party slot points at the same Pal. That is not how a real save looks, but it
     // keeps the fixture to one Pal while still proving both containers resolve — and a
     // test that cares would compare instance ids, which are identical either way.
-    v.extend_from_slice(&container_key(PAL_PARTY_CONTAINER_ID));
+    v.extend_from_slice(&container_key(ids.pal_party_container_id));
     v.extend_from_slice(&container_value(
         &raw_data_property(&occupied),
         "PalContainerCharacterSlotSaveData",
@@ -599,11 +649,11 @@ fn pal_container_map_value() -> Vec<u8> {
 }
 
 /// `DynamicItemSaveData`: one row, matching the id on the synthetic item slot.
-fn dynamic_item_array_value() -> Vec<u8> {
+fn dynamic_item_array_value(ids: &WorldIds) -> Vec<u8> {
     let blob = dynamic_item::encode(&dynamic_item::DynamicItem {
         id: item_container::DynamicId {
             created_world_id: [0u8; 16],
-            local_id_in_created_world: DYNAMIC_ITEM_LOCAL_ID,
+            local_id_in_created_world: ids.dynamic_item_local_id,
         },
         static_id: ascii("ClothArmor"),
         payload: dynamic_item::DynamicItemPayload::Durability {
@@ -638,6 +688,11 @@ fn dynamic_item_array_value() -> Vec<u8> {
 /// A `Players/<uid>.sav`: the save class that identifies it, plus the `SaveData`
 /// holding the player's uid and the container ids that make an inventory resolvable.
 pub fn synthetic_player_sav() -> Vec<u8> {
+    synthetic_player_sav_for(&WORLD_A)
+}
+
+/// A `Players/<uid>.sav` for a specific world's identities.
+pub fn synthetic_player_sav_for(ids: &WorldIds) -> Vec<u8> {
     // A `<Name>ContainerId` is a struct wrapping a single `ID` guid — the same shape
     // whether it names an item container or a Pal container.
     let container_id_struct = |id: [u8; 16]| {
@@ -682,7 +737,7 @@ pub fn synthetic_player_sav() -> Vec<u8> {
     };
 
     let mut inventory_info = Vec::new();
-    write_container_id(&mut inventory_info, "CommonContainerId", CONTAINER_ID);
+    write_container_id(&mut inventory_info, "CommonContainerId", ids.container_id);
     write_fstring(&mut inventory_info, &none_terminator());
 
     let mut save_data = Vec::new();
@@ -701,7 +756,7 @@ pub fn synthetic_player_sav() -> Vec<u8> {
         },
         true,
     );
-    save_data.extend_from_slice(&PLAYER_UID);
+    save_data.extend_from_slice(&ids.player_uid);
     write_property_tag(
         &mut save_data,
         &PropertyTag {
@@ -724,12 +779,12 @@ pub fn synthetic_player_sav() -> Vec<u8> {
     write_container_id(
         &mut save_data,
         "OtomoCharacterContainerId",
-        PAL_PARTY_CONTAINER_ID,
+        ids.pal_party_container_id,
     );
     write_container_id(
         &mut save_data,
         "PalStorageContainerId",
-        PAL_STORAGE_CONTAINER_ID,
+        ids.pal_storage_container_id,
     );
 
     write_fstring(&mut save_data, &none_terminator());
@@ -783,12 +838,17 @@ fn player_header() -> Header {
 /// `GroupSaveDataMap` entry and one `CharacterSaveParameterMap` entry. Built
 /// inner-to-outer so every `size` field is exact.
 pub fn synthetic_sav() -> Vec<u8> {
+    synthetic_sav_for(&WORLD_A)
+}
+
+/// A `Level.sav` built around a specific world's identities.
+pub fn synthetic_sav_for(ids: &WorldIds) -> Vec<u8> {
     let map_value = {
         let mut v = Vec::new();
         write_u32_le(&mut v, 0); // keys-to-remove count
         write_u32_le(&mut v, 1); // entry count
-        v.extend_from_slice(&GUILD_ID); // key: bare Guid (per gvas::hints)
-        v.extend_from_slice(&group_entry_value());
+        v.extend_from_slice(&ids.guild_id); // key: bare Guid (per gvas::hints)
+        v.extend_from_slice(&group_entry_value(ids));
         v
     };
 
@@ -811,7 +871,7 @@ pub fn synthetic_sav() -> Vec<u8> {
         );
         v.extend_from_slice(&map_value);
 
-        let character_value = character_map_value();
+        let character_value = character_map_value(ids);
         write_property_tag(
             &mut v,
             &PropertyTag {
@@ -829,7 +889,7 @@ pub fn synthetic_sav() -> Vec<u8> {
         );
         v.extend_from_slice(&character_value);
 
-        let item_value = item_container_map_value();
+        let item_value = item_container_map_value(ids);
         write_property_tag(
             &mut v,
             &PropertyTag {
@@ -847,7 +907,7 @@ pub fn synthetic_sav() -> Vec<u8> {
         );
         v.extend_from_slice(&item_value);
 
-        let pal_container_value = pal_container_map_value();
+        let pal_container_value = pal_container_map_value(ids);
         write_property_tag(
             &mut v,
             &PropertyTag {
@@ -865,7 +925,7 @@ pub fn synthetic_sav() -> Vec<u8> {
         );
         v.extend_from_slice(&pal_container_value);
 
-        let dynamic_value = dynamic_item_array_value();
+        let dynamic_value = dynamic_item_array_value(ids);
         write_property_tag(
             &mut v,
             &PropertyTag {

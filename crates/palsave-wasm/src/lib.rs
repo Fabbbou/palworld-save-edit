@@ -313,6 +313,30 @@ struct DiagnosticReport {
 }
 
 #[derive(Serialize)]
+struct ConflictView {
+    code: &'static str,
+    /// The colliding identity — a uid, an instance id, a container id. One field rather
+    /// than a variant-shaped payload, because the UI shows it as text either way.
+    id: String,
+}
+
+#[derive(Serialize)]
+struct MigrationPlanView {
+    player_uid: String,
+    pal_count: usize,
+    item_container_count: usize,
+    pal_container_count: usize,
+    dynamic_item_count: usize,
+    row_count: usize,
+    source_group_id: Option<String>,
+    conflicts: Vec<ConflictView>,
+    /// Conflicts that would leave two things sharing an identity. Split out because
+    /// this is the number that decides whether a migration is safe to run, and a UI
+    /// should not have to re-derive it by filtering codes.
+    blocking_count: usize,
+}
+
+#[derive(Serialize)]
 struct Diagnostics {
     engine_version: String,
     save_game_version: u32,
@@ -333,6 +357,19 @@ pub struct SaveHandle {
     /// so holding a few is not a memory concern — but they are stored once, never
     /// cloned per query.
     players: BTreeMap<String, Container>,
+    /// A *second* world, held only while previewing a migration into this one.
+    ///
+    /// `CLAUDE.md`'s memory rule is one copy of the decompressed buffer — meaning never
+    /// duplicate a save, not never hold two different ones. A migration is inherently a
+    /// two-world question, so a second level save is a genuine requirement rather than
+    /// a duplicate. It roughly doubles peak memory (~8.5 MB each), which is far from
+    /// the wasm32 ceiling, and `clearSource` drops it the moment it isn't needed.
+    source: Option<Container>,
+    /// Player saves belonging to `source`, keyed by uid. Kept apart from `players`
+    /// because they describe a different world; mixing the two would let a migration
+    /// read container ids from the wrong save, which is the one mistake
+    /// `palsave::inventory` is written to prevent.
+    source_players: BTreeMap<String, Container>,
 }
 
 #[wasm_bindgen]
@@ -345,6 +382,8 @@ pub fn open(bytes: &[u8]) -> Result<SaveHandle, JsValue> {
     Ok(SaveHandle {
         container,
         players: BTreeMap::new(),
+        source: None,
+        source_players: BTreeMap::new(),
     })
 }
 
@@ -596,6 +635,100 @@ impl SaveHandle {
                     missing: c.missing,
                 })
                 .collect(),
+        })
+    }
+
+    /// Attaches the world a player would be migrated *from*. The open save is always
+    /// the destination — you are editing it — so direction never depends on argument
+    /// order at a call site.
+    #[wasm_bindgen(js_name = attachSourceWorld)]
+    pub fn attach_source_world(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
+        let container =
+            container::decode(bytes).map_err(|e| js_error("container_decode_failed", e))?;
+        // A Players/*.sav would decode fine here and then fail confusingly later, so
+        // reject it now, by the property that actually distinguishes them.
+        palsave::world::open_map(&container.gvas, "CharacterSaveParameterMap")
+            .map_err(|e| js_error(e.code(), e))?;
+        self.source = Some(container);
+        Ok(())
+    }
+
+    /// Attaches a player save belonging to the source world.
+    #[wasm_bindgen(js_name = attachSourcePlayer)]
+    pub fn attach_source_player(&mut self, bytes: &[u8]) -> Result<String, JsValue> {
+        let container =
+            container::decode(bytes).map_err(|e| js_error("container_decode_failed", e))?;
+        let uid = inventory::player_uid(&container.gvas).map_err(inventory_error)?;
+        self.source_players.insert(uid.clone(), container);
+        Ok(uid)
+    }
+
+    /// Players present in the attached source world, as uid strings.
+    #[wasm_bindgen(js_name = sourcePlayers)]
+    pub fn source_players(&self) -> Result<JsValue, JsValue> {
+        let Some(source) = &self.source else {
+            return to_js(&Vec::<String>::new());
+        };
+        let players = characters::list_players(&source.gvas).map_err(character_error)?;
+        let uids: Vec<String> = players.into_iter().map(|p| p.uid).collect();
+        to_js(&uids)
+    }
+
+    /// Drops the source world and its player saves, freeing the second buffer.
+    #[wasm_bindgen(js_name = clearSource)]
+    pub fn clear_source(&mut self) {
+        self.source = None;
+        self.source_players.clear();
+    }
+
+    /// Surveys what migrating `uid` out of the attached source world and into this save
+    /// would move, and what it would collide with. Reads only — nothing is written, by
+    /// this call or any other yet.
+    #[wasm_bindgen(js_name = migrationPlan)]
+    pub fn migration_plan(&self, uid: &str) -> Result<JsValue, JsValue> {
+        let source = self.source.as_ref().ok_or_else(|| {
+            js_error(
+                "no_source_world",
+                "attach the world to migrate from before asking for a plan",
+            )
+        })?;
+        let player = self.source_players.get(uid).ok_or_else(|| {
+            js_error(
+                "player_save_not_attached",
+                format!("no source player save attached for {uid}"),
+            )
+        })?;
+
+        let plan = palsave::migrate::plan(&source.gvas, &player.gvas, &self.container.gvas, uid)
+            .map_err(|e| js_error(e.code(), e))?;
+
+        let conflicts: Vec<ConflictView> = plan
+            .conflicts
+            .iter()
+            .map(|c| ConflictView {
+                code: c.code(),
+                id: match c {
+                    palsave::migrate::Conflict::PlayerExists { uid } => uid.clone(),
+                    palsave::migrate::Conflict::PalInstanceExists { instance_id } => {
+                        instance_id.clone()
+                    }
+                    palsave::migrate::Conflict::ContainerExists { id } => id.clone(),
+                    palsave::migrate::Conflict::DynamicItemExists { id } => id.clone(),
+                    palsave::migrate::Conflict::GuildMissing { group_id } => group_id.clone(),
+                },
+            })
+            .collect();
+
+        to_js(&MigrationPlanView {
+            player_uid: plan.player_uid.clone(),
+            pal_count: plan.pal_entry_indices.len(),
+            item_container_count: plan.item_container_indices.len(),
+            pal_container_count: plan.pal_container_indices.len(),
+            dynamic_item_count: plan.dynamic_item_indices.len(),
+            row_count: plan.row_count(),
+            source_group_id: plan.source_group_id.clone(),
+            blocking_count: plan.blocking_conflicts().count(),
+            conflicts,
         })
     }
 
