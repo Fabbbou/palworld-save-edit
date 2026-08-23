@@ -1386,7 +1386,7 @@ fn level_fixtures() -> Vec<PathBuf> {
 fn rawdata_decoders_round_trip_on_every_level_save() {
     use palsave::gvas::nav::find;
     use palsave::gvas::value::Value;
-    use palsave::rawdata::{character, group, item_container};
+    use palsave::rawdata::{character, character_container, group, item_container};
 
     let levels = level_fixtures();
     if levels.is_empty() {
@@ -1493,10 +1493,216 @@ fn rawdata_decoders_round_trip_on_every_level_save() {
             }
         }
 
+        // Pal containers (box, party, base camps) and their slots.
+        let map = palsave::world::open_map(gvas, "CharacterContainerSaveData").unwrap();
+        let mut pal_slots_checked = 0usize;
+        for entry in &map.entries {
+            let Some(slots) = map
+                .cursor
+                .get_opt(&entry.fields, "Slots")
+                .and_then(|v| v.as_array().map(|a| a.to_vec()))
+            else {
+                continue;
+            };
+            for slot in &slots {
+                let Some(fields) = slot.as_properties() else {
+                    continue;
+                };
+                let Some(rd) = find(fields, "RawData") else {
+                    continue;
+                };
+                let Value::Bytes(blob) = map.cursor.materialize(rd).unwrap() else {
+                    continue;
+                };
+                // The decoder tolerates a longer tail so a future format bump doesn't
+                // blank a Pal box. Pin the width here instead, where a change is a
+                // signal rather than a user-visible failure.
+                assert_eq!(
+                    blob.len(),
+                    38,
+                    "{label}: Pal container slot blob is not 38 bytes — the layout moved"
+                );
+                let decoded = character_container::decode_slot(&blob)
+                    .unwrap_or_else(|e| panic!("{label}: decode_slot: {e}"));
+                assert_eq!(character_container::encode_slot(&decoded), blob);
+                pal_slots_checked += 1;
+            }
+        }
+
         eprintln!(
-            "{label}: ok — {slots_checked} slots, {populated_base_ids} guild(s) with \
-             non-empty base_ids, {populated_role_perms} with role_permissions"
+            "{label}: ok — {slots_checked} item slots, {pal_slots_checked} pal slots, \
+             {populated_base_ids} guild(s) with non-empty base_ids, {populated_role_perms} \
+             with role_permissions"
         );
+    }
+}
+
+/// Every `Level.sav` paired with the player saves sitting next to it.
+///
+/// `player_fixture()` returns one file from one world, which was fine while there was
+/// only one. The two-file join is exactly the kind of thing that can pass on the world
+/// it was written against and fail on the next, so the join tests below run over every
+/// world and every player in it.
+fn worlds_with_players() -> Vec<(PathBuf, Vec<PathBuf>)> {
+    level_fixtures()
+        .into_iter()
+        .map(|level| {
+            let dir = level.parent().unwrap().join("Players");
+            let mut players: Vec<PathBuf> = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "sav"))
+                // `<uid>_dps.sav` is PalDimensionPalStorage, not a player file.
+                .filter(|p| {
+                    !p.file_stem()
+                        .is_some_and(|s| s.to_string_lossy().ends_with("_dps"))
+                })
+                .collect();
+            players.sort();
+            (level, players)
+        })
+        .collect()
+}
+
+/// The Pal-box join, over every world and every player.
+///
+/// Structural checks only — that the ids resolve and the shapes are sane. Whether the
+/// *right* Pal landed in each slot is what the next test settles.
+#[test]
+fn pal_storage_resolves_from_the_player_save() {
+    use palsave::inventory;
+
+    let worlds = worlds_with_players();
+    if worlds.iter().all(|(_, p)| p.is_empty()) {
+        eprintln!("no player fixtures found, skipping");
+        return;
+    }
+
+    for (level_path, players) in worlds {
+        let level = palsave::container::decode(&std::fs::read(&level_path).unwrap()).unwrap();
+        let label = level_path.display();
+
+        for player_path in players {
+            let player = palsave::container::decode(&std::fs::read(&player_path).unwrap()).unwrap();
+            let uid = inventory::player_uid(&player.gvas).unwrap();
+
+            let storage = inventory::player_pal_storage(&level.gvas, &player.gvas).unwrap();
+            assert_eq!(storage.player_uid, uid);
+            assert!(
+                !storage.containers.is_empty(),
+                "{label}/{uid}: no Pal containers — the SaveData lookup found nothing"
+            );
+
+            for container in &storage.containers {
+                assert!(
+                    !container.missing,
+                    "{label}/{uid}: {:?} container {} named by the player save has no entry \
+                     in Level.sav",
+                    container.kind, container.id
+                );
+                assert!(
+                    container.slots.len() <= container.slot_count as usize,
+                    "{label}/{uid}: {:?} holds {} Pals in {} slots",
+                    container.kind,
+                    container.slots.len(),
+                    container.slot_count
+                );
+                for (position, slot) in container.slots.iter().enumerate() {
+                    assert_eq!(slot.slot_index, position as i32);
+                    // A guid that decoded out of the wrong 16 bytes would still be a
+                    // well-formed hex string, so the real check is that it names a Pal
+                    // the world actually contains.
+                    assert!(
+                        slot.pal.is_some(),
+                        "{label}/{uid}: {:?} slot {position} holds instance {} which is \
+                         in no CharacterSaveParameterMap entry — the instance_id field \
+                         is being read from the wrong offset",
+                        container.kind,
+                        slot.instance_id
+                    );
+                }
+            }
+
+            let total: usize = storage.containers.iter().map(|c| c.slots.len()).sum();
+            assert!(total > 0, "{label}/{uid}: every Pal container is empty");
+            eprintln!(
+                "{label}/{uid}: {}",
+                storage
+                    .containers
+                    .iter()
+                    .map(|c| format!("{:?} {}/{}", c.kind, c.slots.len(), c.slot_count))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+}
+
+/// The load-bearing one: two independent paths to "which Pals belong to this player"
+/// must agree.
+///
+/// `pals_of` reads `OwnerPlayerUId` from inside each Pal's own RawData in
+/// `CharacterSaveParameterMap`. `player_pal_storage` reads container ids from the
+/// player's save and slot contents from `CharacterContainerSaveData`. Nothing is shared
+/// between the two but the world itself, so a wrong offset in the container slot
+/// decoder shows up here as a set mismatch rather than as plausible-looking output.
+///
+/// This mirrors `pals_of_agrees_with_independent_sources`, which is the pattern that
+/// has caught the most real bugs in this crate.
+#[test]
+fn pal_storage_agrees_with_ownership() {
+    use palsave::{characters, inventory};
+    use std::collections::BTreeSet;
+
+    let worlds = worlds_with_players();
+    if worlds.iter().all(|(_, p)| p.is_empty()) {
+        eprintln!("no player fixtures found, skipping");
+        return;
+    }
+
+    for (level_path, players) in worlds {
+        let level = palsave::container::decode(&std::fs::read(&level_path).unwrap()).unwrap();
+        let label = level_path.display();
+
+        for player_path in players {
+            let player = palsave::container::decode(&std::fs::read(&player_path).unwrap()).unwrap();
+            let uid = inventory::player_uid(&player.gvas).unwrap();
+
+            let storage = inventory::player_pal_storage(&level.gvas, &player.gvas).unwrap();
+            let in_containers: BTreeSet<String> = storage
+                .containers
+                .iter()
+                .flat_map(|c| c.slots.iter())
+                .map(|s| s.instance_id.clone())
+                .collect();
+
+            let owned: BTreeSet<String> = characters::pals_of(&level.gvas, &uid)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.instance_id)
+                .collect();
+
+            // Every Pal in this player's party or box must name them as owner.
+            let unowned: Vec<&String> = in_containers.difference(&owned).collect();
+            assert!(
+                unowned.is_empty(),
+                "{label}/{uid}: {} Pal(s) sit in this player's containers but do not name \
+                 them as owner: {unowned:?}",
+                unowned.len()
+            );
+
+            // The converse is only a warning: a Pal can name an owner while living in a
+            // base-camp container, which is not reachable from the player's save.
+            let elsewhere = owned.difference(&in_containers).count();
+            eprintln!(
+                "{label}/{uid}: {} in party+box, {} owned, {elsewhere} owned but housed \
+                 elsewhere",
+                in_containers.len(),
+                owned.len()
+            );
+        }
     }
 }
 
