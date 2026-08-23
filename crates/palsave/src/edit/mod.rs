@@ -18,9 +18,11 @@
 //! its ancestors by the same delta. `replace_property_value` does exactly that,
 //! given the ancestor chain.
 //!
-//! Adding or removing map entries or array elements additionally changes a count
-//! field and is deliberately not supported here yet; `replace_property_value` only
-//! swaps one value for another.
+//! Adding or removing a **map entry** additionally changes the map's u32 entry count;
+//! `insert_map_entry` and `remove_map_entry` handle that. Array elements are a
+//! different problem — an `ArrayProperty` of structs writes one inner tag carrying its
+//! own `size`, so an element-count change has a fixup this module has not verified —
+//! and are still unsupported.
 
 pub mod error;
 
@@ -30,6 +32,7 @@ use crate::gvas::PropertyEntry;
 use crate::gvas::primitives::{FString, write_fstring};
 use crate::gvas::property::{PropertyTag, TagExtra};
 use crate::gvas::property::{size_field_offset, value_offset};
+use crate::gvas::value::map_layout;
 use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +127,25 @@ pub fn replace_property_value(
     let Some(leaf) = chain.last() else {
         return Err(EditError::EmptyChain);
     };
+    check_nesting(chain)?;
 
+    let value_start = value_offset(source, leaf.span.start, has_property_guid)?;
+    let old_value_len = leaf.span.end - value_start;
+    let delta = new_value.len() as i64 - old_value_len as i64;
+
+    let mut set = SpliceSet::new();
+    set.replace(value_start..leaf.span.end, new_value);
+    set.merge(size_fixups(source, chain, delta)?);
+
+    Ok(set)
+}
+
+/// Checks that each entry in `chain` physically contains the next.
+///
+/// Assembling a chain from separate `materialize` calls makes it easy to pass siblings
+/// by mistake, and the resulting save would be quietly corrupt — so this is checked,
+/// never assumed.
+fn check_nesting(chain: &[&PropertyEntry]) -> Result<(), EditError> {
     for pair in chain.windows(2) {
         let (outer, inner) = (&pair[0].span, &pair[1].span);
         if !(outer.start <= inner.start && inner.end <= outer.end) {
@@ -134,36 +155,206 @@ pub fn replace_property_value(
             });
         }
     }
+    Ok(())
+}
 
-    let value_start = value_offset(source, leaf.span.start, has_property_guid)?;
-    let old_value_len = leaf.span.end - value_start;
-    let delta = new_value.len() as i64 - old_value_len as i64;
+/// Patches the `size` field of every property in `chain` by `delta`.
+///
+/// This is the whole of what an edit owes the format when a region's length changes —
+/// see the module docs. Shared by the value-replacing and entry-inserting paths so
+/// they cannot drift on which sizes get fixed.
+fn size_fixups(
+    source: &[u8],
+    chain: &[&PropertyEntry],
+    delta: i64,
+) -> Result<SpliceSet, EditError> {
+    let mut set = SpliceSet::new();
+    if delta == 0 {
+        return Ok(set);
+    }
+    for entry in chain {
+        let offset = size_field_offset(source, entry.span.start)?;
+        let old_size = u32::from_le_bytes(
+            source
+                .get(offset..offset + 4)
+                .ok_or(EditError::SpliceOutOfBounds {
+                    range: offset..offset + 4,
+                    source_len: source.len(),
+                })?
+                .try_into()
+                .unwrap(),
+        );
+        let new_size = i64::from(old_size) + delta;
+        let new_size = u32::try_from(new_size).map_err(|_| EditError::SizeOutOfRange {
+            offset,
+            old_size,
+            delta,
+        })?;
+        set.replace(offset..offset + 4, new_size.to_le_bytes().to_vec());
+    }
+    Ok(set)
+}
+
+/// The raw bytes of one map entry — a key immediately followed by its value, exactly
+/// as they sit on the wire.
+///
+/// This is the unit that moves between saves. It is deliberately opaque: copying a
+/// player's `CharacterSaveParameterMap` entry into another world does not require
+/// understanding a single field inside it, only that both worlds agree on the map's
+/// key and value *types*, which [`insert_map_entry`]'s caller is responsible for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapEntryBytes(pub Vec<u8>);
+
+/// Extracts one entry's bytes so it can be inserted into another save.
+pub fn map_entry_bytes(
+    source: &[u8],
+    map: &PropertyEntry,
+    index: usize,
+    engine_major: u16,
+    has_property_guid: bool,
+    path: &str,
+) -> Result<MapEntryBytes, EditError> {
+    let layout = map_layout(source, map, engine_major, has_property_guid, path)?;
+    let span = layout
+        .entries
+        .get(index)
+        .ok_or(EditError::MapEntryOutOfRange {
+            index,
+            count: layout.entries.len(),
+        })?;
+    Ok(MapEntryBytes(source[span.clone()].to_vec()))
+}
+
+/// Refuses a map that records pending key removals.
+///
+/// Checked by reading the count directly, *before* the layout walk: a map with removals
+/// would also make the walk land somewhere unexpected, and "this shape isn't supported"
+/// is a far more useful answer than "the layout didn't add up". No Palworld map seen
+/// has any — `map_layouts_have_no_pending_key_removals` asserts that across both
+/// worlds — so this is a guard against an unseen shape, not a live case.
+fn reject_removed_keys(
+    source: &[u8],
+    map: &PropertyEntry,
+    has_property_guid: bool,
+) -> Result<(), EditError> {
+    let value_start = value_offset(source, map.span.start, has_property_guid)?;
+    let bytes = source
+        .get(value_start..value_start + 4)
+        .ok_or(EditError::SpliceOutOfBounds {
+            range: value_start..value_start + 4,
+            source_len: source.len(),
+        })?;
+    let count = u32::from_le_bytes(bytes.try_into().unwrap());
+    if count != 0 {
+        return Err(EditError::MapHasRemovedKeys { count });
+    }
+    Ok(())
+}
+
+/// How many entries a map holds, counted from its wire layout rather than from a
+/// decoded view. `world::open_map` skips entries whose value isn't a property list, so
+/// its `entries.len()` is a lower bound; index arithmetic for a splice needs this one.
+pub fn map_layout_entry_count(
+    source: &[u8],
+    map: &PropertyEntry,
+    engine_major: u16,
+    has_property_guid: bool,
+    path: &str,
+) -> usize {
+    map_layout(source, map, engine_major, has_property_guid, path)
+        .map(|l| l.entries.len())
+        .unwrap_or(0)
+}
+
+/// Appends an entry to a `MapProperty`, patching the entry count and enclosing sizes.
+///
+/// `chain` runs outermost-first and must end with the map itself — e.g.
+/// `[worldSaveData, CharacterSaveParameterMap]`. Unlike
+/// [`replace_property_value`] the leaf is not being rewritten; bytes are inserted at
+/// its end, which is what makes this the operation the module docs used to list as
+/// unsupported.
+///
+/// Three things change, and the whole correctness argument is that there is no fourth:
+///
+/// 1. the entry's bytes go in at the end of the map's value region,
+/// 2. the u32 entry count goes up by one,
+/// 3. every enclosing `size` grows by the entry's length.
+///
+/// Map entries carry no per-entry length and the map's value region has no terminator,
+/// so appending needs nothing else. `verify_reparses` is what actually proves that on
+/// each edit — a missed fixup makes the buffer stop being an exact partition.
+///
+/// **Duplicate keys are not checked.** This layer cannot compare keys without knowing
+/// their type, and a map with two identical keys is a corrupt save that reads back
+/// fine. Callers that can compare keys must do so; `characters::import_*` does.
+pub fn insert_map_entry(
+    source: &[u8],
+    chain: &[&PropertyEntry],
+    entry: &MapEntryBytes,
+    engine_major: u16,
+    has_property_guid: bool,
+    path: &str,
+) -> Result<SpliceSet, EditError> {
+    let Some(map) = chain.last() else {
+        return Err(EditError::EmptyChain);
+    };
+    check_nesting(chain)?;
+
+    reject_removed_keys(source, map, has_property_guid)?;
+    let layout = map_layout(source, map, engine_major, has_property_guid, path)?;
+
+    let new_count =
+        u32::try_from(layout.entries.len() + 1).map_err(|_| EditError::SizeOutOfRange {
+            offset: layout.entry_count_offset,
+            old_size: layout.entries.len() as u32,
+            delta: 1,
+        })?;
 
     let mut set = SpliceSet::new();
-    set.replace(value_start..leaf.span.end, new_value);
+    // Zero-length range at the map's end: pure insertion, nothing overwritten.
+    set.replace(map.span.end..map.span.end, entry.0.clone());
+    set.replace(
+        layout.entry_count_offset..layout.entry_count_offset + 4,
+        new_count.to_le_bytes().to_vec(),
+    );
+    set.merge(size_fixups(source, chain, entry.0.len() as i64)?);
 
-    if delta != 0 {
-        for entry in chain {
-            let offset = size_field_offset(source, entry.span.start)?;
-            let old_size = u32::from_le_bytes(
-                source
-                    .get(offset..offset + 4)
-                    .ok_or(EditError::SpliceOutOfBounds {
-                        range: offset..offset + 4,
-                        source_len: source.len(),
-                    })?
-                    .try_into()
-                    .unwrap(),
-            );
-            let new_size = i64::from(old_size) + delta;
-            let new_size = u32::try_from(new_size).map_err(|_| EditError::SizeOutOfRange {
-                offset,
-                old_size,
-                delta,
-            })?;
-            set.replace(offset..offset + 4, new_size.to_le_bytes().to_vec());
-        }
-    }
+    Ok(set)
+}
+
+/// Removes one entry from a `MapProperty`. The inverse of [`insert_map_entry`].
+pub fn remove_map_entry(
+    source: &[u8],
+    chain: &[&PropertyEntry],
+    index: usize,
+    engine_major: u16,
+    has_property_guid: bool,
+    path: &str,
+) -> Result<SpliceSet, EditError> {
+    let Some(map) = chain.last() else {
+        return Err(EditError::EmptyChain);
+    };
+    check_nesting(chain)?;
+
+    reject_removed_keys(source, map, has_property_guid)?;
+    let layout = map_layout(source, map, engine_major, has_property_guid, path)?;
+
+    let span = layout
+        .entries
+        .get(index)
+        .ok_or(EditError::MapEntryOutOfRange {
+            index,
+            count: layout.entries.len(),
+        })?
+        .clone();
+
+    let mut set = SpliceSet::new();
+    set.replace(span.clone(), Vec::new());
+    set.replace(
+        layout.entry_count_offset..layout.entry_count_offset + 4,
+        ((layout.entries.len() - 1) as u32).to_le_bytes().to_vec(),
+    );
+    set.merge(size_fixups(source, chain, -(span.len() as i64))?);
 
     Ok(set)
 }
@@ -292,6 +483,8 @@ pub fn verify_reparses(bytes: &[u8]) -> Result<(), EditError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gvas::primitives::write_u32_le;
+    use crate::gvas::property::{none_terminator, write_property_tag};
 
     #[test]
     fn apply_splices_in_source_order() {
@@ -361,5 +554,131 @@ mod tests {
         let err =
             replace_property_value(&[0u8; 64], &[&outer, &sibling], vec![], true).unwrap_err();
         assert!(matches!(err, EditError::NotNested { .. }));
+    }
+
+    /// A map whose entries are bare guids, built by hand so these run without fixtures.
+    /// `hints` has no entry for this path, so the default applies: Guid keys, generic
+    /// struct values — and an empty property list is just a `None` terminator.
+    fn guid_map(entries: &[[u8; 16]]) -> (Vec<u8>, PropertyEntry) {
+        let mut value = Vec::new();
+        write_u32_le(&mut value, 0); // no pending key removals
+        write_u32_le(&mut value, entries.len() as u32);
+        for key in entries {
+            value.extend_from_slice(key);
+            write_fstring(&mut value, &none_terminator()); // empty value struct
+        }
+
+        let mut buf = Vec::new();
+        write_property_tag(
+            &mut buf,
+            &PropertyTag {
+                name: ascii_fstring("M"),
+                type_name: ascii_fstring("MapProperty"),
+                size: value.len() as u32,
+                index: 0,
+                extra: TagExtra::Map {
+                    key_type: ascii_fstring("StructProperty"),
+                    value_type: ascii_fstring("StructProperty"),
+                },
+                guid: None,
+            },
+            true,
+        );
+        let span_start = 0;
+        buf.extend_from_slice(&value);
+        let entry = PropertyEntry {
+            name: "M".into(),
+            type_name: "MapProperty".into(),
+            span: span_start..buf.len(),
+        };
+        (buf, entry)
+    }
+
+    fn ascii_fstring(s: &str) -> FString {
+        FString::Ascii {
+            content: s.as_bytes().to_vec(),
+            trailing: vec![0],
+        }
+    }
+
+    #[test]
+    fn map_entry_bytes_slices_at_entry_boundaries() {
+        let (buf, map) = guid_map(&[[1u8; 16], [2u8; 16]]);
+        let second = map_entry_bytes(&buf, &map, 1, 5, true, "M").unwrap();
+        assert_eq!(&second.0[..16], &[2u8; 16]);
+
+        let err = map_entry_bytes(&buf, &map, 2, 5, true, "M").unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::MapEntryOutOfRange { index: 2, count: 2 }
+        ));
+    }
+
+    #[test]
+    fn insert_then_remove_round_trips_on_a_hand_built_map() {
+        let (buf, map) = guid_map(&[[1u8; 16], [2u8; 16]]);
+        let chain = [&map];
+
+        let entry = MapEntryBytes({
+            let mut v = [3u8; 16].to_vec();
+            write_fstring(&mut v, &none_terminator());
+            v
+        });
+
+        let bigger = insert_map_entry(&buf, &chain, &entry, 5, true, "M")
+            .unwrap()
+            .apply(&buf)
+            .unwrap();
+        assert_eq!(bigger.len(), buf.len() + entry.0.len());
+
+        let bigger_map = PropertyEntry {
+            span: map.span.start..map.span.end + entry.0.len(),
+            ..map.clone()
+        };
+        let layout = map_layout(&bigger, &bigger_map, 5, true, "M").unwrap();
+        assert_eq!(layout.entries.len(), 3);
+
+        let restored = remove_map_entry(&bigger, &[&bigger_map], 2, 5, true, "M")
+            .unwrap()
+            .apply(&bigger)
+            .unwrap();
+        assert_eq!(restored, buf);
+    }
+
+    /// Removing from the middle has to shift the tail, which is the case an
+    /// append-only implementation would get wrong.
+    #[test]
+    fn removing_a_middle_entry_keeps_the_others_in_order() {
+        let (buf, map) = guid_map(&[[1u8; 16], [2u8; 16], [3u8; 16]]);
+        // Take the removed entry's length from the layout rather than recomputing it —
+        // the test should not carry its own model of how wide an entry is.
+        let removed_len = map_layout(&buf, &map, 5, true, "M").unwrap().entries[1].len();
+
+        let smaller = remove_map_entry(&buf, &[&map], 1, 5, true, "M")
+            .unwrap()
+            .apply(&buf)
+            .unwrap();
+
+        let smaller_map = PropertyEntry {
+            span: map.span.start..map.span.end - removed_len,
+            ..map.clone()
+        };
+        let layout = map_layout(&smaller, &smaller_map, 5, true, "M").unwrap();
+        assert_eq!(layout.entries.len(), 2);
+        assert_eq!(&smaller[layout.entries[0].start..][..16], &[1u8; 16]);
+        assert_eq!(&smaller[layout.entries[1].start..][..16], &[3u8; 16]);
+    }
+
+    #[test]
+    fn a_map_with_pending_key_removals_is_refused() {
+        let (mut buf, map) = guid_map(&[[1u8; 16]]);
+        // Flip removed_count to 1 without adding the key it implies. The point is the
+        // refusal, which must happen before anything is written.
+        let value_start = value_offset(&buf, map.span.start, true).unwrap();
+        buf[value_start..value_start + 4].copy_from_slice(&1u32.to_le_bytes());
+
+        let err =
+            insert_map_entry(&buf, &[&map], &MapEntryBytes(vec![0; 4]), 5, true, "M").unwrap_err();
+        assert!(matches!(err, EditError::MapHasRemovedKeys { count: 1 }));
     }
 }

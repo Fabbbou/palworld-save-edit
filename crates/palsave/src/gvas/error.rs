@@ -19,6 +19,14 @@ pub enum GvasError {
         name: String,
         at: usize,
     },
+    /// A layout walk ended somewhere other than the property's declared end. Only
+    /// raised by `value::map_layout`, where landing off by even one byte would mean
+    /// slicing an entry in half — so it fails loudly instead of returning spans that
+    /// look plausible.
+    TrailingBytes {
+        at: usize,
+        expected: usize,
+    },
 }
 
 impl fmt::Display for GvasError {
@@ -40,6 +48,13 @@ impl fmt::Display for GvasError {
             ),
             GvasError::UnknownPropertyType { name, at } => {
                 write!(f, "unknown property type {name:?} at offset {at}")
+            }
+            GvasError::TrailingBytes { at, expected } => {
+                write!(
+                    f,
+                    "layout walk ended at offset {at} but the property declares it ends \
+                     at {expected}"
+                )
             }
         }
     }

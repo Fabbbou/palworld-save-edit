@@ -47,6 +47,17 @@ pub enum EditError {
     /// some `size` field disagrees with the real byte layout. The buffer is not
     /// returned; see `edit::verify_reparses`.
     VerificationFailed,
+    /// A map entry was asked for by an index the map doesn't have.
+    MapEntryOutOfRange {
+        index: usize,
+        count: usize,
+    },
+    /// The map records pending key removals before its entries. No Palworld map seen
+    /// has any, so rather than guess at how they're laid out — and write the entry
+    /// count into the wrong offset — insert and remove refuse.
+    MapHasRemovedKeys {
+        count: u32,
+    },
 }
 
 impl From<GvasError> for EditError {
@@ -103,6 +114,14 @@ impl fmt::Display for EditError {
                     "edited buffer did not re-parse into an exact partition of itself"
                 )
             }
+            EditError::MapEntryOutOfRange { index, count } => {
+                write!(f, "map entry {index} requested but the map has {count}")
+            }
+            EditError::MapHasRemovedKeys { count } => write!(
+                f,
+                "map records {count} pending key removal(s); inserting or removing \
+                 entries in such a map isn't supported"
+            ),
         }
     }
 }

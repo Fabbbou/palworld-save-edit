@@ -1930,6 +1930,184 @@ fn dynamic_item_ids_resolve_or_are_zero() {
     }
 }
 
+/// Inserting a map entry and removing it again must return the exact original bytes.
+///
+/// This is the gate for the capability migration is blocked on. An insert touches three
+/// things — the entry bytes, the u32 entry count, and every enclosing `size` — and the
+/// claim is that there is no fourth. A round-trip to byte-identity is what makes that
+/// claim falsifiable: any missed fixup leaves a difference somewhere in the buffer, and
+/// any *extra* write shows up the same way.
+///
+/// Run over `CharacterSaveParameterMap` because that is the map a migrated player and
+/// their Pals actually land in, and it is the largest, so a size fixup that overflows or
+/// lands on the wrong ancestor has the most room to show itself.
+#[test]
+fn inserting_then_removing_a_map_entry_restores_the_original_bytes() {
+    use palsave::edit;
+    use palsave::gvas::GvasFile;
+
+    for level in level_fixtures() {
+        let container = palsave::container::decode(&std::fs::read(&level).unwrap()).unwrap();
+        let original = &container.gvas;
+        let label = level.display();
+
+        let path = "worldSaveData.CharacterSaveParameterMap";
+        let file = GvasFile::parse(original).unwrap();
+        let engine_major = file.header.engine_version_major;
+        let has_property_guid = file.header.has_property_guid();
+
+        let map = palsave::world::open_map(original, "CharacterSaveParameterMap").unwrap();
+        let chain = [&map.world_entry, &map.map_entry];
+
+        let before = edit::map_layout_entry_count(
+            original,
+            &map.map_entry,
+            engine_major,
+            has_property_guid,
+            path,
+        );
+
+        // Copy entry 0 and append it. A duplicate key is a corrupt save the game would
+        // dislike, but it is structurally identical to inserting a foreign entry, which
+        // is what migration does — and it needs no second world to be present.
+        let entry = edit::map_entry_bytes(
+            original,
+            &map.map_entry,
+            0,
+            engine_major,
+            has_property_guid,
+            path,
+        )
+        .unwrap();
+        assert!(!entry.0.is_empty(), "{label}: entry 0 has no bytes");
+
+        let inserted = edit::insert_map_entry(
+            original,
+            &chain,
+            &entry,
+            engine_major,
+            has_property_guid,
+            path,
+        )
+        .unwrap()
+        .apply(original)
+        .unwrap();
+
+        // The strongest single check the format offers: parse must reproduce the buffer
+        // exactly, which is only true when every size field agrees at every depth.
+        edit::verify_reparses(&inserted).unwrap_or_else(|e| {
+            panic!("{label}: buffer with an inserted entry did not re-parse: {e}")
+        });
+        assert_eq!(inserted.len(), original.len() + entry.0.len());
+
+        // And the map really grew, rather than the bytes landing somewhere inert.
+        let after_map = palsave::world::open_map(&inserted, "CharacterSaveParameterMap").unwrap();
+        let after = edit::map_layout_entry_count(
+            &inserted,
+            &after_map.map_entry,
+            engine_major,
+            has_property_guid,
+            path,
+        );
+        assert_eq!(
+            after,
+            before + 1,
+            "{label}: entry count did not grow by one"
+        );
+
+        let appended = edit::map_entry_bytes(
+            &inserted,
+            &after_map.map_entry,
+            after - 1,
+            engine_major,
+            has_property_guid,
+            path,
+        )
+        .unwrap();
+        assert_eq!(
+            appended, entry,
+            "{label}: the appended entry read back changed"
+        );
+
+        // Now take it out again.
+        let after_chain = [&after_map.world_entry, &after_map.map_entry];
+        let restored = edit::remove_map_entry(
+            &inserted,
+            &after_chain,
+            after - 1,
+            engine_major,
+            has_property_guid,
+            path,
+        )
+        .unwrap()
+        .apply(&inserted)
+        .unwrap();
+
+        assert_eq!(
+            restored.len(),
+            original.len(),
+            "{label}: removing the inserted entry did not restore the length"
+        );
+        assert!(
+            restored == *original,
+            "{label}: insert-then-remove is not the identity — a fixup is missing or extra"
+        );
+
+        eprintln!("{label}: {before} entries, +1 and back, byte-identical");
+    }
+}
+
+/// No Palworld map records pending key removals.
+///
+/// `edit::insert_map_entry` refuses such a map rather than guess where the entry count
+/// sits after them. That refusal is only a reasonable design if the case genuinely
+/// doesn't arise — so check, across every map in every world, rather than assume.
+#[test]
+fn map_layouts_have_no_pending_key_removals() {
+    use palsave::gvas::GvasFile;
+    use palsave::gvas::value::map_layout;
+
+    for level in level_fixtures() {
+        let container = palsave::container::decode(&std::fs::read(&level).unwrap()).unwrap();
+        let gvas = &container.gvas;
+        let label = level.display();
+
+        let file = GvasFile::parse(gvas).unwrap();
+        let engine_major = file.header.engine_version_major;
+        let has_property_guid = file.header.has_property_guid();
+
+        let world_idx = file
+            .properties
+            .iter()
+            .position(|p| p.name == "worldSaveData")
+            .unwrap();
+        let world = file.materialize(world_idx).unwrap();
+        let children = world.as_properties().unwrap();
+
+        let mut checked = 0usize;
+        for child in children {
+            if child.type_name != "MapProperty" {
+                continue;
+            }
+            let path = format!("worldSaveData.{}", child.name);
+            // Maps this crate can't fully walk are skipped, not failed — the claim
+            // under test is about the ones the edit path can actually reach.
+            let Ok(layout) = map_layout(gvas, child, engine_major, has_property_guid, &path) else {
+                continue;
+            };
+            assert_eq!(
+                layout.removed_count, 0,
+                "{label}: {} records {} pending key removal(s); \
+                 edit::insert_map_entry's refusal would now be a live limitation",
+                child.name, layout.removed_count
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "{label}: no maps were walkable at all");
+        eprintln!("{label}: {checked} maps, none with pending key removals");
+    }
+}
+
 /// Guild members and players must agree on what a uid looks like.
 ///
 /// They did not. `guilds.rs` carried its own copy of `guid_to_hex` that was never

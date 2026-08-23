@@ -20,6 +20,7 @@ use super::primitives::{
     read_u8, read_u16_le, read_u32_le, read_u64_le,
 };
 use super::property::{PropertyTag, TagExtra, read_property_tag};
+use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -182,6 +183,127 @@ fn large_world_coordinates(engine_major: u16) -> bool {
     engine_major >= 5
 }
 
+/// Struct-typed map keys and values carry no struct-type name on the wire, so the type
+/// is looked up by path (see `gvas::hints`). The fallback when the table has no entry
+/// is the same default uesave-rs itself uses: `Guid` for keys, a generic property list
+/// for values.
+///
+/// Factored out because [`map_layout`] has to make the identical choice. If the two
+/// ever disagreed, the spans it reports would not line up with the values
+/// `try_materialize_value` decodes, and an entry copied between saves would be sliced
+/// at the wrong boundary.
+fn map_struct_defaults(path: &str) -> (&'static str, &'static str) {
+    let key_default = match super::hints::lookup(&format!("{path}.Key")) {
+        Some(super::hints::StructHint::Guid) | None => "Guid",
+        Some(super::hints::StructHint::Generic) => "Struct",
+    };
+    let value_default = match super::hints::lookup(&format!("{path}.Value")) {
+        Some(super::hints::StructHint::Guid) => "Guid",
+        Some(super::hints::StructHint::Generic) | None => "Struct",
+    };
+    (key_default, value_default)
+}
+
+/// Where a `MapProperty`'s parts sit in the buffer, for edits that add or remove
+/// entries rather than rewriting a value in place.
+///
+/// `Value::Map` throws offsets away — it is a decoded view, not a layout — so anything
+/// that needs to splice at an entry boundary has to recover them. See
+/// [`crate::edit::insert_map_entry`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapLayout {
+    /// Number of "keys to remove" recorded before the entries. Zero in every Palworld
+    /// map seen so far; the edit functions refuse a non-zero one rather than guess.
+    pub removed_count: u32,
+    /// Offset of the u32 entry count, which an insert or remove has to patch.
+    pub entry_count_offset: usize,
+    /// `key_start..value_end` for each entry, in wire order. Copying one of these byte
+    /// ranges is exactly what moving an entry between saves means.
+    pub entries: Vec<Range<usize>>,
+}
+
+/// Walks a `MapProperty`'s value region recording byte boundaries.
+///
+/// Deliberately re-walks rather than threading offsets through `Value`: the decoded
+/// tree is the common path and stays free of layout concerns, while this runs only when
+/// something is about to be spliced. Both share [`map_struct_defaults`] and
+/// `read_value_by_type`, so they cannot disagree about where a value ends.
+pub fn map_layout(
+    source: &[u8],
+    entry: &PropertyEntry,
+    engine_major: u16,
+    has_property_guid: bool,
+    path: &str,
+) -> Result<MapLayout, GvasError> {
+    let mut pos = entry.span.start;
+    let tag = read_property_tag(source, &mut pos, has_property_guid)?
+        .expect("indexed property span always starts at a real tag, never the None terminator");
+    let TagExtra::Map {
+        key_type,
+        value_type,
+    } = &tag.extra
+    else {
+        return Err(GvasError::UnknownPropertyType {
+            name: tag.type_name.display_lossy(),
+            at: entry.span.start,
+        });
+    };
+
+    let (key_default, value_default) = map_struct_defaults(path);
+
+    let removed_count = read_u32_le(source, &mut pos)?;
+    for _ in 0..removed_count {
+        read_value_by_type(
+            source,
+            &mut pos,
+            key_type,
+            key_default,
+            engine_major,
+            has_property_guid,
+        )?;
+    }
+
+    let entry_count_offset = pos;
+    let entry_count = read_u32_le(source, &mut pos)?;
+
+    let mut entries = Vec::with_capacity(entry_count as usize);
+    for _ in 0..entry_count {
+        let start = pos;
+        read_value_by_type(
+            source,
+            &mut pos,
+            key_type,
+            key_default,
+            engine_major,
+            has_property_guid,
+        )?;
+        read_value_by_type(
+            source,
+            &mut pos,
+            value_type,
+            value_default,
+            engine_major,
+            has_property_guid,
+        )?;
+        entries.push(start..pos);
+    }
+
+    // The walk must land exactly on the property's declared end. Anything else means
+    // the layout was misread, and splicing against it would cut an entry in half.
+    if pos != entry.span.end {
+        return Err(GvasError::TrailingBytes {
+            at: pos,
+            expected: entry.span.end,
+        });
+    }
+
+    Ok(MapLayout {
+        removed_count,
+        entry_count_offset,
+        entries,
+    })
+}
+
 /// Re-parses `entry`'s tag from `source` and decodes its value. `source` must be the
 /// same buffer the entry's span was computed against. `path` is this property's own
 /// dotted path from the save root (e.g. `"worldSaveData.GroupSaveDataMap"`) — used
@@ -260,18 +382,7 @@ fn try_materialize_value(
             key_type,
             value_type,
         } => {
-            // Struct-typed keys/values have no struct-type name on the wire — look
-            // one up by path (see gvas::hints), falling back to the same default
-            // uesave-rs itself uses when its own hint table comes up empty: Guid for
-            // keys, a generic property list for values.
-            let key_default = match super::hints::lookup(&format!("{path}.Key")) {
-                Some(super::hints::StructHint::Guid) | None => "Guid",
-                Some(super::hints::StructHint::Generic) => "Struct",
-            };
-            let value_default = match super::hints::lookup(&format!("{path}.Value")) {
-                Some(super::hints::StructHint::Guid) => "Guid",
-                Some(super::hints::StructHint::Generic) | None => "Struct",
-            };
+            let (key_default, value_default) = map_struct_defaults(path);
             let removed_count = read_u32_le(buf, pos)?;
             for _ in 0..removed_count {
                 read_value_by_type(
