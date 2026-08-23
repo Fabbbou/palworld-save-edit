@@ -18,10 +18,21 @@ Pal is in which slot; per-item durability, loaded ammunition, and what's inside 
 **Editing:** guild names, Pal stats (level, exp, the three IVs), Pal nicknames, and
 player level and exp.
 
-**Not yet:** editing inventory or Pal-box contents, migrating a player between saves,
-the raw property tree browser, and in-place write-back with automatic backup. Anything
-stored in `Players/<uid>.sav` is read-only for now — the export path only rewrites
-`Level.sav`.
+**Migration** (moving a player, their Pals and their belongings between worlds) can be
+**previewed**: attach the other world plus that player's save and see exactly which rows
+would move and what identities they'd collide with. Applying is not implemented — the
+preview is the part that has to be right first.
+
+**Not yet:** applying a migration, editing inventory or Pal-box contents, the raw
+property tree browser, and in-place write-back with automatic backup. Anything stored in
+`Players/<uid>.sav` is read-only for now — the export path only rewrites `Level.sav`.
+
+### One thing worth knowing about the format
+
+Pal `InstanceId`s look like random GUIDs but are **not globally unique across worlds** —
+two unrelated saves here share three of them, and in each case the Pals are the same
+species. So a migration cannot copy rows verbatim; it has to renumber. That's why the
+preview exists, and why it reports collisions rather than resolving them silently.
 
 ## Development
 
