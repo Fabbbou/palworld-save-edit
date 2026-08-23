@@ -2057,6 +2057,94 @@ fn inserting_then_removing_a_map_entry_restores_the_original_bytes() {
     }
 }
 
+/// The array counterpart of the map insert/remove gate, on `DynamicItemSaveData` —
+/// the array a migrated player's items actually need.
+///
+/// Byte-identity after insert-then-remove is the check that the inner tag's `size` is
+/// being maintained. `verify_reparses` alone would not notice a wrong one, so it is
+/// asserted directly as well.
+#[test]
+fn inserting_then_removing_an_array_element_restores_the_original_bytes() {
+    use palsave::edit;
+    use palsave::gvas::GvasFile;
+    use palsave::gvas::value::array_layout;
+
+    for level in level_fixtures() {
+        let container = palsave::container::decode(&std::fs::read(&level).unwrap()).unwrap();
+        let original = &container.gvas;
+        let label = level.display();
+
+        let file = GvasFile::parse(original).unwrap();
+        let engine_major = file.header.engine_version_major;
+        let has_property_guid = file.header.has_property_guid();
+
+        let array = palsave::world::open_array(original, "DynamicItemSaveData").unwrap();
+        let chain = [&array.world_entry, &array.array_entry];
+        let before = array_layout(
+            original,
+            &array.array_entry,
+            engine_major,
+            has_property_guid,
+        )
+        .unwrap();
+
+        let element = edit::array_element_bytes(
+            original,
+            &array.array_entry,
+            0,
+            engine_major,
+            has_property_guid,
+        )
+        .unwrap();
+        assert!(!element.0.is_empty());
+
+        let inserted =
+            edit::insert_array_element(original, &chain, &element, engine_major, has_property_guid)
+                .unwrap()
+                .apply(original)
+                .unwrap();
+        edit::verify_reparses(&inserted)
+            .unwrap_or_else(|e| panic!("{label}: array insert did not re-parse: {e}"));
+
+        let after_array = palsave::world::open_array(&inserted, "DynamicItemSaveData").unwrap();
+        let after = array_layout(
+            &inserted,
+            &after_array.array_entry,
+            engine_major,
+            has_property_guid,
+        )
+        .unwrap();
+        assert_eq!(after.elements.len(), before.elements.len() + 1);
+        // The fixup verify_reparses is blind to, asserted where it can be seen.
+        assert_eq!(
+            after.inner_size,
+            before.inner_size + element.0.len() as u32,
+            "{label}: the array's inner element tag size did not grow with the array"
+        );
+
+        let after_chain = [&after_array.world_entry, &after_array.array_entry];
+        let restored = edit::remove_array_element(
+            &inserted,
+            &after_chain,
+            after.elements.len() - 1,
+            engine_major,
+            has_property_guid,
+        )
+        .unwrap()
+        .apply(&inserted)
+        .unwrap();
+
+        assert!(
+            restored == *original,
+            "{label}: array insert-then-remove is not the identity"
+        );
+        eprintln!(
+            "{label}: {} elements, +1 and back, byte-identical",
+            before.elements.len()
+        );
+    }
+}
+
 /// No Palworld map records pending key removals.
 ///
 /// `edit::insert_map_entry` refuses such a map rather than guess where the entry count
@@ -2105,6 +2193,72 @@ fn map_layouts_have_no_pending_key_removals() {
         }
         assert!(checked > 0, "{label}: no maps were walkable at all");
         eprintln!("{label}: {checked} maps, none with pending key removals");
+    }
+}
+
+/// What an array's nested element tag puts in its `size` field.
+///
+/// This is the open question that keeps array-element insert/delete unsupported, and it
+/// can't be settled by `verify_reparses`: the GVAS writer replays spans, so a wrong
+/// inner size round-trips perfectly and only the game would object. So measure it
+/// against real data instead of reasoning about it.
+///
+/// Two candidates are plausible — the size of one element, or the total of all bodies.
+/// The answer decides what an element insert has to patch, and it is recorded here so
+/// the next person doesn't have to re-derive it.
+#[test]
+fn array_inner_tag_size_covers_all_element_bodies() {
+    use palsave::gvas::GvasFile;
+    use palsave::gvas::value::array_layout;
+
+    for level in level_fixtures() {
+        let container = palsave::container::decode(&std::fs::read(&level).unwrap()).unwrap();
+        let gvas = &container.gvas;
+        let label = level.display();
+
+        let file = GvasFile::parse(gvas).unwrap();
+        let engine_major = file.header.engine_version_major;
+        let has_property_guid = file.header.has_property_guid();
+
+        let world_idx = file
+            .properties
+            .iter()
+            .position(|p| p.name == "worldSaveData")
+            .unwrap();
+        let world = file.materialize(world_idx).unwrap();
+        let children = world.as_properties().unwrap();
+
+        let mut checked = 0usize;
+        for child in children {
+            if child.type_name != "ArrayProperty" {
+                continue;
+            }
+            // Arrays of bytes have no inner tag; array_layout rejects them.
+            let Ok(layout) = array_layout(gvas, child, engine_major, has_property_guid) else {
+                continue;
+            };
+            if layout.elements.is_empty() {
+                continue;
+            }
+            let total: usize = layout.elements.iter().map(|e| e.len()).sum();
+            assert_eq!(
+                layout.inner_size as usize,
+                total,
+                "{label}: {} has {} elements totalling {total} bytes but its inner tag \
+                 declares {}",
+                child.name,
+                layout.elements.len(),
+                layout.inner_size
+            );
+            eprintln!(
+                "{label}: {} — {} elements, inner size {} == total body bytes",
+                child.name,
+                layout.elements.len(),
+                layout.inner_size
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "{label}: no struct arrays were walkable");
     }
 }
 

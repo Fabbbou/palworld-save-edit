@@ -19,10 +19,15 @@
 //! given the ancestor chain.
 //!
 //! Adding or removing a **map entry** additionally changes the map's u32 entry count;
-//! `insert_map_entry` and `remove_map_entry` handle that. Array elements are a
-//! different problem — an `ArrayProperty` of structs writes one inner tag carrying its
-//! own `size`, so an element-count change has a fixup this module has not verified —
-//! and are still unsupported.
+//! `insert_map_entry` and `remove_map_entry` handle that.
+//!
+//! An **array element** changes one thing more. An `ArrayProperty` of structs is
+//! `[u32 count][inner tag][body]×count`, and that nested element tag carries a `size`
+//! of its own, holding the total length of every body — measured, not assumed, by
+//! `array_inner_tag_size_covers_all_element_bodies`. It had to be measured because
+//! `verify_reparses` cannot see it: the writer replays spans, so a wrong inner size
+//! round-trips perfectly and only the game would notice. `insert_array_element` and
+//! `remove_array_element` patch it.
 
 pub mod error;
 
@@ -32,7 +37,7 @@ use crate::gvas::PropertyEntry;
 use crate::gvas::primitives::{FString, write_fstring};
 use crate::gvas::property::{PropertyTag, TagExtra};
 use crate::gvas::property::{size_field_offset, value_offset};
-use crate::gvas::value::map_layout;
+use crate::gvas::value::{array_layout, map_layout};
 use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +360,138 @@ pub fn remove_map_entry(
         ((layout.entries.len() - 1) as u32).to_le_bytes().to_vec(),
     );
     set.merge(size_fixups(source, chain, -(span.len() as i64))?);
+
+    Ok(set)
+}
+
+/// The raw bytes of one array element body, as they sit on the wire. The array's
+/// nested element tag is written once for the whole array, so an element is body bytes
+/// only — no tag of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrayElementBytes(pub Vec<u8>);
+
+/// Extracts one array element's bytes so it can be inserted into another save.
+pub fn array_element_bytes(
+    source: &[u8],
+    array: &PropertyEntry,
+    index: usize,
+    engine_major: u16,
+    has_property_guid: bool,
+) -> Result<ArrayElementBytes, EditError> {
+    let layout = array_layout(source, array, engine_major, has_property_guid)?;
+    let span = layout
+        .elements
+        .get(index)
+        .ok_or(EditError::MapEntryOutOfRange {
+            index,
+            count: layout.elements.len(),
+        })?;
+    Ok(ArrayElementBytes(source[span.clone()].to_vec()))
+}
+
+/// Appends an element to an `ArrayProperty` of structs.
+///
+/// One more fixup than [`insert_map_entry`], and it is the reason arrays were left
+/// unsupported until it could be measured rather than assumed. The array's value is
+/// `[u32 count][inner tag][body]×count`, and that nested element tag carries a `size`
+/// field of its own. `array_inner_tag_size_covers_all_element_bodies` establishes what
+/// it holds — **the total length of every element body**, verified across 10 arrays in
+/// two worlds — so it grows with the array.
+///
+/// That could not have been settled by `verify_reparses`: the GVAS writer replays
+/// spans, so a wrong inner size round-trips perfectly and only the game would object.
+/// Hence the measurement.
+///
+/// So four things change: the element bytes, the count, the inner tag's size, and every
+/// enclosing size.
+pub fn insert_array_element(
+    source: &[u8],
+    chain: &[&PropertyEntry],
+    element: &ArrayElementBytes,
+    engine_major: u16,
+    has_property_guid: bool,
+) -> Result<SpliceSet, EditError> {
+    let Some(array) = chain.last() else {
+        return Err(EditError::EmptyChain);
+    };
+    check_nesting(chain)?;
+
+    let layout = array_layout(source, array, engine_major, has_property_guid)?;
+    let delta = element.0.len() as i64;
+
+    let new_count =
+        u32::try_from(layout.elements.len() + 1).map_err(|_| EditError::SizeOutOfRange {
+            offset: layout.count_offset,
+            old_size: layout.elements.len() as u32,
+            delta: 1,
+        })?;
+    let new_inner = u32::try_from(i64::from(layout.inner_size) + delta).map_err(|_| {
+        EditError::SizeOutOfRange {
+            offset: layout.inner_size_offset,
+            old_size: layout.inner_size,
+            delta,
+        }
+    })?;
+
+    let mut set = SpliceSet::new();
+    set.replace(array.span.end..array.span.end, element.0.clone());
+    set.replace(
+        layout.count_offset..layout.count_offset + 4,
+        new_count.to_le_bytes().to_vec(),
+    );
+    set.replace(
+        layout.inner_size_offset..layout.inner_size_offset + 4,
+        new_inner.to_le_bytes().to_vec(),
+    );
+    set.merge(size_fixups(source, chain, delta)?);
+
+    Ok(set)
+}
+
+/// Removes one element from an `ArrayProperty` of structs. The inverse of
+/// [`insert_array_element`].
+pub fn remove_array_element(
+    source: &[u8],
+    chain: &[&PropertyEntry],
+    index: usize,
+    engine_major: u16,
+    has_property_guid: bool,
+) -> Result<SpliceSet, EditError> {
+    let Some(array) = chain.last() else {
+        return Err(EditError::EmptyChain);
+    };
+    check_nesting(chain)?;
+
+    let layout = array_layout(source, array, engine_major, has_property_guid)?;
+    let span = layout
+        .elements
+        .get(index)
+        .ok_or(EditError::MapEntryOutOfRange {
+            index,
+            count: layout.elements.len(),
+        })?
+        .clone();
+    let delta = -(span.len() as i64);
+
+    let new_inner = u32::try_from(i64::from(layout.inner_size) + delta).map_err(|_| {
+        EditError::SizeOutOfRange {
+            offset: layout.inner_size_offset,
+            old_size: layout.inner_size,
+            delta,
+        }
+    })?;
+
+    let mut set = SpliceSet::new();
+    set.replace(span.clone(), Vec::new());
+    set.replace(
+        layout.count_offset..layout.count_offset + 4,
+        ((layout.elements.len() - 1) as u32).to_le_bytes().to_vec(),
+    );
+    set.replace(
+        layout.inner_size_offset..layout.inner_size_offset + 4,
+        new_inner.to_le_bytes().to_vec(),
+    );
+    set.merge(size_fixups(source, chain, delta)?);
 
     Ok(set)
 }

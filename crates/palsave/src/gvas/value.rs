@@ -222,6 +222,97 @@ pub struct MapLayout {
     pub entries: Vec<Range<usize>>,
 }
 
+/// Where an `ArrayProperty`-of-structs' parts sit in the buffer.
+///
+/// Structurally the array is `[u32 count][inner tag][body]×count`. The inner tag is the
+/// complication that maps don't have: it carries a `size` field of its own, so changing
+/// the element count means deciding what that field is supposed to say. See
+/// `array_inner_tag_size_covers_all_element_bodies` for what the game actually writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrayLayout {
+    /// Offset of the u32 element count.
+    pub count_offset: usize,
+    /// Offset of the `size` field inside the array's nested element tag.
+    pub inner_size_offset: usize,
+    /// What that field currently says.
+    pub inner_size: u32,
+    /// Byte span of each element body, in wire order.
+    pub elements: Vec<Range<usize>>,
+}
+
+/// Walks an `ArrayProperty` of structs recording byte boundaries.
+///
+/// Returns `UnknownPropertyType` for arrays of anything else — `TArray<uint8>`
+/// (`RawData`) has no inner tag and no element boundaries worth naming.
+pub fn array_layout(
+    source: &[u8],
+    entry: &PropertyEntry,
+    engine_major: u16,
+    has_property_guid: bool,
+) -> Result<ArrayLayout, GvasError> {
+    let mut pos = entry.span.start;
+    let tag = read_property_tag(source, &mut pos, has_property_guid)?
+        .expect("indexed property span always starts at a real tag, never the None terminator");
+    let TagExtra::Array { inner_type } = &tag.extra else {
+        return Err(GvasError::UnknownPropertyType {
+            name: tag.type_name.display_lossy(),
+            at: entry.span.start,
+        });
+    };
+    if inner_type.ascii_str() != Some("StructProperty") {
+        return Err(GvasError::UnknownPropertyType {
+            name: inner_type.display_lossy(),
+            at: entry.span.start,
+        });
+    }
+
+    let count_offset = pos;
+    let count = read_u32_le(source, &mut pos)?;
+
+    let inner_tag_start = pos;
+    let inner_tag = read_property_tag(source, &mut pos, has_property_guid)?.ok_or_else(|| {
+        GvasError::UnknownPropertyType {
+            name: "None".to_string(),
+            at: inner_tag_start,
+        }
+    })?;
+    let TagExtra::Struct { struct_type, .. } = &inner_tag.extra else {
+        return Err(GvasError::UnknownPropertyType {
+            name: "expected nested StructProperty tag in struct array".to_string(),
+            at: inner_tag_start,
+        });
+    };
+    let struct_type = struct_type.ascii_str().unwrap_or("").to_string();
+    let inner_size_offset = super::property::size_field_offset(source, inner_tag_start)?;
+
+    let mut elements = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let start = pos;
+        read_struct_body(
+            source,
+            &mut pos,
+            &struct_type,
+            engine_major,
+            has_property_guid,
+        )?;
+        elements.push(start..pos);
+    }
+
+    if pos != entry.span.end {
+        return Err(GvasError::TrailingBytes {
+            at: pos,
+            expected: entry.span.end,
+        });
+    }
+
+    Ok(ArrayLayout {
+        count_offset,
+        inner_size_offset,
+        inner_size: inner_tag.size,
+        elements,
+    })
+}
+
 /// Walks a `MapProperty`'s value region recording byte boundaries.
 ///
 /// Deliberately re-walks rather than threading offsets through `Value`: the decoded
