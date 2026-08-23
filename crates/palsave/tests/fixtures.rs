@@ -858,3 +858,213 @@ fn guild_api_round_trips_on_level_sav() {
         guild.name
     );
 }
+
+/// The character task layer against a real save: player detection, uid convention,
+/// and Pal decoding.
+#[test]
+fn lists_players_on_level_sav() {
+    use palsave::characters;
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/Level.sav");
+    if !path.exists() {
+        eprintln!("no Level.sav fixture found, skipping");
+        return;
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let container = palsave::container::decode(&bytes).unwrap();
+
+    let players = characters::list_players(&container.gvas).unwrap();
+    assert_eq!(players.len(), 1, "fixture has exactly one player");
+    let player = &players[0];
+
+    // The uid must render in Unreal's display convention, because that is what names
+    // the player's own save file. A raw byte-order dump would print ...01000000 here
+    // and silently fail to pair with Players/<uid>.sav.
+    let player_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/Players");
+    if let Ok(entries) = std::fs::read_dir(&player_dir) {
+        let stems: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "sav"))
+            .filter_map(|e| {
+                e.path()
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+            })
+            .collect();
+        assert!(
+            stems.contains(&player.uid),
+            "player uid {} matched none of the Players/*.sav filenames {stems:?}",
+            player.uid
+        );
+    }
+
+    assert!(player.nickname.is_some(), "player should have a NickName");
+    assert!(player.level.unwrap_or(0) > 0, "player should have a level");
+    assert!(player.pal_count > 0, "player should own Pals");
+
+    eprintln!(
+        "player {} level {:?} owns {} pals",
+        player.uid, player.level, player.pal_count
+    );
+}
+
+#[test]
+fn lists_pals_on_level_sav() {
+    use palsave::characters;
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/Level.sav");
+    if !path.exists() {
+        eprintln!("no Level.sav fixture found, skipping");
+        return;
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let container = palsave::container::decode(&bytes).unwrap();
+
+    let pals = characters::list_all_pals(&container.gvas).unwrap();
+    let players = characters::list_players(&container.gvas).unwrap();
+
+    // Every character is either a player or a Pal; nothing may be dropped.
+    assert_eq!(
+        pals.len() + players.len(),
+        137,
+        "fixture has 137 characters total"
+    );
+
+    // CharacterID is the species and is present on every Pal in this fixture — if a
+    // future save makes it absent the decode still succeeds, but this asserts the
+    // field name hasn't moved.
+    assert!(
+        pals.iter().all(|p| p.character_id.is_some()),
+        "every Pal should decode a CharacterID"
+    );
+    assert!(
+        pals.iter().any(|p| p.talent_hp.is_some()),
+        "at least one Pal should decode IVs"
+    );
+    assert!(
+        pals.iter().any(|p| !p.passive_skills.is_empty()),
+        "at least one Pal should decode passive skills"
+    );
+}
+
+/// The load-bearing cross-check: the player↔Pal ownership link, validated against an
+/// independently-decoded structure. `pals_of` reads `OwnerPlayerUId` out of each
+/// Pal's RawData; the guild's `individual_character_handle_ids` is a completely
+/// separate list in a different map. If the uid convention or the owner lookup were
+/// wrong, `pals_of` would silently return zero and only this test would notice.
+#[test]
+fn pals_of_agrees_with_independent_sources() {
+    use palsave::characters;
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/Level.sav");
+    if !path.exists() {
+        eprintln!("no Level.sav fixture found, skipping");
+        return;
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let container = palsave::container::decode(&bytes).unwrap();
+
+    let players = characters::list_players(&container.gvas).unwrap();
+    let player = &players[0];
+
+    let owned = characters::pals_of(&container.gvas, &player.uid).unwrap();
+    assert!(
+        !owned.is_empty(),
+        "pals_of returned nothing — owner lookup is broken"
+    );
+    assert_eq!(
+        owned.len(),
+        player.pal_count,
+        "pals_of disagrees with the summary's own pal_count"
+    );
+
+    // Every Pal it returned really does name this player.
+    assert!(
+        owned
+            .iter()
+            .all(|p| p.owner_player_uid.as_deref() == Some(player.uid.as_str())),
+        "pals_of returned a Pal owned by someone else"
+    );
+
+    // The guild lists every character in the guild — owned Pals plus base-camp Pals
+    // plus the player — so it bounds the owned count from above and must not be
+    // wildly larger, which would mean owner reads are being missed.
+    let guilds = palsave::guilds::list(&container.gvas).unwrap();
+    if let Some(guild) = guilds
+        .iter()
+        .find(|g| g.group_type == palsave::rawdata::group::GUILD)
+    {
+        assert!(
+            owned.len() <= guild.pal_count,
+            "owned pals ({}) exceed the guild's character handles ({})",
+            owned.len(),
+            guild.pal_count
+        );
+        eprintln!(
+            "owned {} of {} guild character handles",
+            owned.len(),
+            guild.pal_count
+        );
+    }
+
+    // player() must agree with the standalone calls.
+    let detail = characters::player(&container.gvas, &player.uid).unwrap();
+    assert_eq!(detail.summary, *player);
+    assert_eq!(detail.pals.len(), owned.len());
+
+    // Error paths carry stable codes.
+    assert_eq!(
+        characters::player(&container.gvas, "nope")
+            .unwrap_err()
+            .code(),
+        "malformed_uid"
+    );
+    assert_eq!(
+        characters::player(&container.gvas, &"0".repeat(32))
+            .unwrap_err()
+            .code(),
+        "player_not_found"
+    );
+}
+
+/// Regression guard for the blob-relative span trap `gvas::nav::Cursor::rebase`
+/// exists to prevent: a RawData blob's property spans index the blob, not the save.
+/// Materializing with the wrong buffer yields no error, just wrong bytes — so assert
+/// the values are actually sane, not merely that the call succeeded.
+#[test]
+fn character_navigation_is_blob_relative() {
+    use palsave::characters;
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/Level.sav");
+    if !path.exists() {
+        eprintln!("no Level.sav fixture found, skipping");
+        return;
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let container = palsave::container::decode(&bytes).unwrap();
+    let pals = characters::list_all_pals(&container.gvas).unwrap();
+
+    for pal in &pals {
+        // Species names are ASCII identifiers; garbage from a wrong-buffer read would
+        // not be.
+        if let Some(id) = &pal.character_id {
+            assert!(
+                !id.is_empty() && id.chars().all(|c| c.is_ascii_graphic()),
+                "implausible CharacterID {id:?} — reading from the wrong buffer?"
+            );
+        }
+        // IVs are a 0..=100 game stat stored in a byte.
+        for iv in [pal.talent_hp, pal.talent_shot, pal.talent_defense]
+            .into_iter()
+            .flatten()
+        {
+            assert!(
+                (0..=100).contains(&iv),
+                "IV {iv} outside the plausible 0..=100"
+            );
+        }
+        if let Some(level) = pal.level {
+            assert!((1..=100).contains(&level), "level {level} outside 1..=100");
+        }
+    }
+}

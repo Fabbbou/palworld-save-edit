@@ -9,7 +9,16 @@
  * structured-cloned, so a multi-megabyte `Level.sav` is never duplicated.
  */
 
-import type { Diagnostics, GuildDetail, GuildSummary, SaveError, SaveSummary } from '../save-types';
+import type {
+  Diagnostics,
+  GuildDetail,
+  GuildSummary,
+  PalSummary,
+  PlayerDetail,
+  PlayerSummary,
+  SaveError,
+  SaveSummary,
+} from '../save-types';
 
 export type Request =
   | { id: number; kind: 'open'; bytes: ArrayBuffer }
@@ -17,6 +26,9 @@ export type Request =
   | { id: number; kind: 'listGuilds' }
   | { id: number; kind: 'guild'; guildId: string }
   | { id: number; kind: 'setGuildName'; guildId: string; name: string }
+  | { id: number; kind: 'listPlayers' }
+  | { id: number; kind: 'player'; uid: string }
+  | { id: number; kind: 'palsOf'; uid: string }
   | { id: number; kind: 'diagnostics' }
   | { id: number; kind: 'export' }
   | { id: number; kind: 'close' };
@@ -28,6 +40,9 @@ export interface ResultOf {
   listGuilds: GuildSummary[];
   guild: GuildDetail;
   setGuildName: null;
+  listPlayers: PlayerSummary[];
+  player: PlayerDetail;
+  palsOf: PalSummary[];
   diagnostics: Diagnostics;
   export: ArrayBuffer;
   close: null;

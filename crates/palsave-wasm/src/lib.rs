@@ -17,6 +17,7 @@
 //! ceiling and `Level.sav` decompresses to ~8.5 MB, so a handle that accumulated
 //! copies per edit would be a real problem on a big server save.
 
+use palsave::characters;
 use palsave::container::{self, Algorithm, Container};
 use palsave::guilds;
 use serde::Serialize;
@@ -39,6 +40,10 @@ fn js_error(code: &'static str, message: impl std::fmt::Display) -> JsValue {
 }
 
 fn guild_error(e: guilds::GuildError) -> JsValue {
+    js_error(e.code(), e)
+}
+
+fn character_error(e: characters::CharacterError) -> JsValue {
     js_error(e.code(), e)
 }
 
@@ -111,6 +116,87 @@ struct GuildDetailView {
     summary: GuildSummaryView,
     admin_player_uid: Option<String>,
     members: Vec<GuildMemberView>,
+}
+
+/// `i64` game stats cross as strings for the same reason `GuildMemberView` does:
+/// exp and fixed-point HP both run past what a JS number holds exactly, and a
+/// silently-rounded stat is worse than no stat.
+#[derive(Serialize)]
+struct PlayerSummaryView {
+    uid: String,
+    instance_id: String,
+    nickname: Option<String>,
+    level: Option<i64>,
+    exp: Option<String>,
+    hp: Option<String>,
+    shield_hp: Option<String>,
+    full_stomach: Option<f32>,
+    pal_count: usize,
+}
+
+impl From<&characters::PlayerSummary> for PlayerSummaryView {
+    fn from(p: &characters::PlayerSummary) -> Self {
+        PlayerSummaryView {
+            uid: p.uid.clone(),
+            instance_id: p.instance_id.clone(),
+            nickname: p.nickname.clone(),
+            level: p.level,
+            exp: p.exp.map(|v| v.to_string()),
+            hp: p.hp.map(|v| v.to_string()),
+            shield_hp: p.shield_hp.map(|v| v.to_string()),
+            full_stomach: p.full_stomach,
+            pal_count: p.pal_count,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PalSummaryView {
+    instance_id: String,
+    owner_player_uid: Option<String>,
+    character_id: Option<String>,
+    nickname: Option<String>,
+    gender: Option<String>,
+    level: Option<i64>,
+    exp: Option<String>,
+    hp: Option<String>,
+    talent_hp: Option<i64>,
+    talent_shot: Option<i64>,
+    talent_defense: Option<i64>,
+    passive_skills: Vec<String>,
+    friendship_point: Option<i64>,
+    rank: Option<i64>,
+    sanity_value: Option<f32>,
+    is_rare: bool,
+}
+
+impl From<&characters::PalSummary> for PalSummaryView {
+    fn from(p: &characters::PalSummary) -> Self {
+        PalSummaryView {
+            instance_id: p.instance_id.clone(),
+            owner_player_uid: p.owner_player_uid.clone(),
+            character_id: p.character_id.clone(),
+            nickname: p.nickname.clone(),
+            gender: p.gender.clone(),
+            level: p.level,
+            exp: p.exp.map(|v| v.to_string()),
+            hp: p.hp.map(|v| v.to_string()),
+            talent_hp: p.talent_hp,
+            talent_shot: p.talent_shot,
+            talent_defense: p.talent_defense,
+            passive_skills: p.passive_skills.clone(),
+            friendship_point: p.friendship_point,
+            rank: p.rank,
+            sanity_value: p.sanity_value,
+            is_rare: p.is_rare,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PlayerDetailView {
+    summary: PlayerSummaryView,
+    pals: Vec<PalSummaryView>,
 }
 
 #[derive(Serialize)]
@@ -206,6 +292,29 @@ impl SaveHandle {
         // Replace rather than keep both buffers — see the module docs on the 4 GB ceiling.
         self.container.gvas = edited;
         Ok(())
+    }
+
+    #[wasm_bindgen(js_name = listPlayers)]
+    pub fn list_players(&self) -> Result<JsValue, JsValue> {
+        let players = characters::list_players(&self.container.gvas).map_err(character_error)?;
+        let views: Vec<PlayerSummaryView> = players.iter().map(PlayerSummaryView::from).collect();
+        to_js(&views)
+    }
+
+    #[wasm_bindgen]
+    pub fn player(&self, uid: &str) -> Result<JsValue, JsValue> {
+        let detail = characters::player(&self.container.gvas, uid).map_err(character_error)?;
+        to_js(&PlayerDetailView {
+            summary: PlayerSummaryView::from(&detail.summary),
+            pals: detail.pals.iter().map(PalSummaryView::from).collect(),
+        })
+    }
+
+    #[wasm_bindgen(js_name = palsOf)]
+    pub fn pals_of(&self, uid: &str) -> Result<JsValue, JsValue> {
+        let pals = characters::pals_of(&self.container.gvas, uid).map_err(character_error)?;
+        let views: Vec<PalSummaryView> = pals.iter().map(PalSummaryView::from).collect();
+        to_js(&views)
     }
 
     #[wasm_bindgen]

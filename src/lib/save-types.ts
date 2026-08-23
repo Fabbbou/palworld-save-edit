@@ -66,6 +66,63 @@ export interface GuildDetail {
   members: GuildMember[];
 }
 
+/**
+ * A player character from `CharacterSaveParameterMap`.
+ *
+ * Nearly every field is nullable, and that is the data's shape rather than
+ * defensiveness: Palworld only writes a `SaveParameter` field once it differs from
+ * the default, and renames fields between versions. Render a missing value as "—",
+ * never as 0.
+ *
+ * `exp`, `hp` and `shield_hp` are decimal **strings**: they are i64 game stats
+ * (fixed-point HP runs to seven figures) and would lose precision as JS numbers.
+ * Use `BigInt` for arithmetic.
+ */
+export interface PlayerSummary {
+  /** 32 hex chars in Unreal's display convention — this is also the name of the
+   *  player's own `Players/<uid>.sav` file. */
+  uid: string;
+  instance_id: string;
+  nickname: string | null;
+  level: number | null;
+  exp: string | null;
+  hp: string | null;
+  shield_hp: string | null;
+  full_stomach: number | null;
+  /** Pals naming this player as owner. Base-camp Pals have no owner and aren't
+   *  counted here. */
+  pal_count: number;
+}
+
+export interface PalSummary {
+  instance_id: string;
+  owner_player_uid: string | null;
+  /** Species id, e.g. `ChickenPal`. */
+  character_id: string | null;
+  nickname: string | null;
+  gender: string | null;
+  level: number | null;
+  exp: string | null;
+  hp: string | null;
+  /** The three IVs, 0–100. */
+  talent_hp: number | null;
+  talent_shot: number | null;
+  talent_defense: number | null;
+  passive_skills: string[];
+  friendship_point: number | null;
+  /** Condensation rank; absent on most Pals. */
+  rank: number | null;
+  sanity_value: number | null;
+  /** The underlying field only exists on rare Pals, so `false` means "not rare",
+   *  not "unknown". */
+  is_rare: boolean;
+}
+
+export interface PlayerDetail {
+  summary: PlayerSummary;
+  pals: PalSummary[];
+}
+
 export interface Diagnostics {
   engine_version: string;
   save_game_version: number;
@@ -89,6 +146,10 @@ export interface SaveError {
     | 'rawdata_decode_failed'
     | 'edit_failed'
     | 'no_group_map'
+    | 'not_a_level_save'
+    | 'map_not_found'
+    | 'player_not_found'
+    | 'malformed_uid'
     | 'guild_not_found'
     | 'not_a_named_guild'
     | 'malformed_guild_id'

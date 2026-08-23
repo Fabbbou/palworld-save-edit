@@ -71,12 +71,15 @@ pub fn decode(bytes: &[u8], has_property_guid: bool) -> Result<CharacterData, Ra
     })
 }
 
-/// Writes back byte-identically *only* when no property inside `object` has been
-/// edited — `object`'s bytes (including the "None" terminator) are replayed
-/// verbatim from `source` rather than re-derived from the indexed entries. Once
-/// Phase 4's splice engine exists, an edited entry gets re-encoded instead of
-/// copied; until then, editing one and calling this produces the pre-edit bytes,
-/// not the edit.
+/// Re-emits the blob from `source`: `object`'s bytes (including the "None"
+/// terminator) are replayed verbatim rather than re-derived from the indexed
+/// entries, so the result is byte-identical to what was decoded.
+///
+/// This is **not** the path for editing a character's properties. `CharacterData`
+/// holds spans, not values, so there is nothing here to mutate — an edit inside
+/// `object` is applied by splicing the save directly with
+/// `crate::edit::replace_property_value`, whose ancestor chain reaches the property
+/// without this function being involved at all.
 pub fn encode(source: &[u8], data: &CharacterData) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&source[..data.object_end]);

@@ -119,8 +119,167 @@ fn group_entry_value() -> Vec<u8> {
     out
 }
 
+const PLAYER_UID: [u8; 16] = [
+    // Little-endian 1 in the final u32 group, so this renders as
+    // "00000000000000000000000000000001" — Palworld's own player-file naming.
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0,
+];
+const PLAYER_INSTANCE_ID: [u8; 16] = [0x77; 16];
+
+/// A `SaveParameter` property list for a player: the `IsPlayer` flag that classifies
+/// the entry, plus a couple of stats to prove values survive the crossing.
+fn player_save_parameter() -> Vec<u8> {
+    let mut out = Vec::new();
+
+    write_property_tag(
+        &mut out,
+        &PropertyTag {
+            name: ascii("Level"),
+            type_name: ascii("ByteProperty"),
+            size: 1,
+            index: 0,
+            extra: TagExtra::Byte {
+                enum_type: ascii("None"),
+            },
+            guid: None,
+        },
+        true,
+    );
+    out.push(34);
+
+    let nick = {
+        let mut v = Vec::new();
+        write_fstring(&mut v, &ascii("Tester"));
+        v
+    };
+    write_property_tag(
+        &mut out,
+        &PropertyTag {
+            name: ascii("NickName"),
+            type_name: ascii("StrProperty"),
+            size: nick.len() as u32,
+            index: 0,
+            extra: TagExtra::None,
+            guid: None,
+        },
+        true,
+    );
+    out.extend_from_slice(&nick);
+
+    write_property_tag(
+        &mut out,
+        &PropertyTag {
+            name: ascii("IsPlayer"),
+            type_name: ascii("BoolProperty"),
+            size: 0,
+            index: 0,
+            extra: TagExtra::Bool(true),
+            guid: None,
+        },
+        true,
+    );
+
+    write_fstring(&mut out, &none_terminator());
+    out
+}
+
+/// The `PalCharacterData` RawData blob: a nested property list holding
+/// `SaveParameter`, then 4 unknown bytes, a group id, and 4 trailing bytes.
+fn player_raw_data() -> Vec<u8> {
+    let save_parameter = player_save_parameter();
+
+    let mut object = Vec::new();
+    write_property_tag(
+        &mut object,
+        &PropertyTag {
+            name: ascii("SaveParameter"),
+            type_name: ascii("StructProperty"),
+            size: save_parameter.len() as u32,
+            index: 0,
+            extra: TagExtra::Struct {
+                struct_type: ascii("PalIndividualCharacterSaveParameter"),
+                guid: [0u8; 16],
+            },
+            guid: None,
+        },
+        true,
+    );
+    object.extend_from_slice(&save_parameter);
+    write_fstring(&mut object, &none_terminator());
+
+    let mut blob = object;
+    blob.extend_from_slice(&[0, 0, 0, 0]); // unknown_bytes
+    blob.extend_from_slice(&GUILD_ID); // group_id
+    blob.extend_from_slice(&[0, 0, 0, 0]); // trailing_bytes
+    blob
+}
+
+/// One `CharacterSaveParameterMap` entry. The key carries the PlayerUId, which is
+/// where `characters::list_players` reads the uid from — not the value.
+fn character_map_value() -> Vec<u8> {
+    let mut v = Vec::new();
+    write_u32_le(&mut v, 0); // keys-to-remove count
+    write_u32_le(&mut v, 1); // entry count
+
+    // Key: a property list (PlayerUId + InstanceId), per gvas::hints.
+    let mut key = Vec::new();
+    for (name, guid) in [
+        ("PlayerUId", PLAYER_UID),
+        ("InstanceId", PLAYER_INSTANCE_ID),
+    ] {
+        write_property_tag(
+            &mut key,
+            &PropertyTag {
+                name: ascii(name),
+                type_name: ascii("StructProperty"),
+                size: 16,
+                index: 0,
+                extra: TagExtra::Struct {
+                    struct_type: ascii("Guid"),
+                    guid: [0u8; 16],
+                },
+                guid: None,
+            },
+            true,
+        );
+        key.extend_from_slice(&guid);
+    }
+    write_fstring(&mut key, &none_terminator());
+    v.extend_from_slice(&key);
+
+    // Value: a property list holding the RawData blob.
+    let blob = player_raw_data();
+    let raw_value = {
+        let mut r = Vec::new();
+        write_u32_le(&mut r, blob.len() as u32);
+        r.extend_from_slice(&blob);
+        r
+    };
+    let mut value = Vec::new();
+    write_property_tag(
+        &mut value,
+        &PropertyTag {
+            name: ascii("RawData"),
+            type_name: ascii("ArrayProperty"),
+            size: raw_value.len() as u32,
+            index: 0,
+            extra: TagExtra::Array {
+                inner_type: ascii("ByteProperty"),
+            },
+            guid: None,
+        },
+        true,
+    );
+    value.extend_from_slice(&raw_value);
+    write_fstring(&mut value, &none_terminator());
+    v.extend_from_slice(&value);
+
+    v
+}
+
 /// A minimal but structurally real Level.sav: header, `worldSaveData`, one
-/// `GroupSaveDataMap` entry. Built inner-to-outer so every `size` field is exact.
+/// `GroupSaveDataMap` entry and one `CharacterSaveParameterMap` entry. Built
+/// inner-to-outer so every `size` field is exact.
 fn synthetic_sav() -> Vec<u8> {
     let map_value = {
         let mut v = Vec::new();
@@ -149,6 +308,25 @@ fn synthetic_sav() -> Vec<u8> {
             true,
         );
         v.extend_from_slice(&map_value);
+
+        let character_value = character_map_value();
+        write_property_tag(
+            &mut v,
+            &PropertyTag {
+                name: ascii("CharacterSaveParameterMap"),
+                type_name: ascii("MapProperty"),
+                size: character_value.len() as u32,
+                index: 0,
+                extra: TagExtra::Map {
+                    key_type: ascii("StructProperty"),
+                    value_type: ascii("StructProperty"),
+                },
+                guid: None,
+            },
+            true,
+        );
+        v.extend_from_slice(&character_value);
+
         write_fstring(&mut v, &none_terminator());
         v
     };
@@ -287,6 +465,34 @@ fn open_edit_export_round_trips() {
 }
 
 #[wasm_bindgen_test]
+fn players_and_pals_cross_the_boundary() {
+    let handle = open(&synthetic_sav()).expect("open");
+    let players = js_sys::Array::from(&handle.list_players().expect("listPlayers"));
+    assert_eq!(players.length(), 1);
+
+    let player = players.get(0);
+    assert_eq!(get(&player, "nickname").as_string().unwrap(), "Tester");
+    assert_eq!(get(&player, "level").as_f64().unwrap(), 34.0);
+    // Rendered in Unreal's convention, which is also the player's save filename.
+    assert_eq!(
+        get(&player, "uid").as_string().unwrap(),
+        "00000000000000000000000000000001"
+    );
+
+    // player() agrees with the list.
+    let uid = get(&player, "uid").as_string().unwrap();
+    let detail = handle.player(&uid).expect("player");
+    let summary = get(&detail, "summary");
+    assert_eq!(get(&summary, "nickname").as_string().unwrap(), "Tester");
+    // This synthetic save has no Pals, so the roster is empty rather than absent.
+    assert_eq!(js_sys::Array::from(&get(&detail, "pals")).length(), 0);
+    assert_eq!(
+        js_sys::Array::from(&handle.pals_of(&uid).expect("palsOf")).length(),
+        0
+    );
+}
+
+#[wasm_bindgen_test]
 fn errors_cross_with_machine_readable_codes() {
     let Err(err) = open(b"not a save file at all") else {
         panic!("garbage bytes must not open")
@@ -304,6 +510,12 @@ fn errors_cross_with_machine_readable_codes() {
 
     let err = handle.set_guild_name("nope", "x").unwrap_err();
     assert_eq!(get(&err, "code").as_string().unwrap(), "malformed_guild_id");
+
+    let err = handle.player("nope").unwrap_err();
+    assert_eq!(get(&err, "code").as_string().unwrap(), "malformed_uid");
+
+    let err = handle.player(&"0".repeat(32)).unwrap_err();
+    assert_eq!(get(&err, "code").as_string().unwrap(), "player_not_found");
 }
 
 #[wasm_bindgen_test]

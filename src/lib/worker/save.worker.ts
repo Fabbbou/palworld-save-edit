@@ -64,6 +64,12 @@ async function handleRequest(req: Request): Promise<{ value: unknown; transfer: 
     case 'setGuildName':
       requireHandle().setGuildName(req.guildId, req.name);
       return { value: null, transfer: [] };
+    case 'listPlayers':
+      return { value: requireHandle().listPlayers(), transfer: [] };
+    case 'player':
+      return { value: requireHandle().player(req.uid), transfer: [] };
+    case 'palsOf':
+      return { value: requireHandle().palsOf(req.uid), transfer: [] };
     case 'diagnostics':
       return { value: requireHandle().diagnostics(), transfer: [] };
     case 'export': {

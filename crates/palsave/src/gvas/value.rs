@@ -74,6 +74,110 @@ pub enum StructValue {
     Properties(Vec<PropertyEntry>),
 }
 
+/// Typed accessors. Every one returns `Option` and never panics: a caller reading a
+/// game field it expected to be an `i32` should degrade to "unknown" rather than
+/// fail, because Palworld renames and retypes fields between versions and a screen
+/// that refuses to render over one missing stat is worse than one showing a blank.
+impl Value {
+    pub fn as_i32(&self) -> Option<i32> {
+        match self {
+            Value::Int(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Any integer-ish scalar widened to `i64`. Palworld is inconsistent about widths
+    /// for conceptually similar fields — a Pal's `Level` is a `ByteProperty` while its
+    /// `Exp` is an `Int64Property` — so most callers want this rather than an
+    /// exact-variant match.
+    pub fn as_integer(&self) -> Option<i64> {
+        match self {
+            Value::Byte(v) => Some(i64::from(*v)),
+            Value::UInt16(v) => Some(i64::from(*v)),
+            Value::UInt32(v) => Some(i64::from(*v)),
+            Value::Int(v) => Some(i64::from(*v)),
+            Value::Int64(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            Value::Float(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_byte(&self) -> Option<u8> {
+        match self {
+            Value::Byte(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Lossy display text for any of the string-shaped variants. For display and for
+    /// matching known ASCII identifiers — not for byte-exact round-tripping, which
+    /// goes through `FString` itself.
+    pub fn as_text(&self) -> Option<String> {
+        match self {
+            Value::Str(s) | Value::Name(s) | Value::Enum(s) | Value::ByteLabel(s) => {
+                Some(s.display_lossy())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_guid(&self) -> Option<Guid> {
+        match self {
+            Value::Struct(StructValue::Guid(g)) => Some(*g),
+            _ => None,
+        }
+    }
+
+    /// FDateTime ticks (100ns intervals since 0001-01-01).
+    pub fn as_ticks(&self) -> Option<u64> {
+        match self {
+            Value::Struct(StructValue::DateTime(t)) => Some(*t),
+            _ => None,
+        }
+    }
+
+    pub fn as_properties(&self) -> Option<&[PropertyEntry]> {
+        match self {
+            Value::Struct(StructValue::Properties(p)) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn as_array(&self) -> Option<&[Value]> {
+        match self {
+            Value::Array(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Value::Bytes(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn as_map(&self) -> Option<&[(Value, Value)]> {
+        match self {
+            Value::Map(entries) => Some(entries),
+            _ => None,
+        }
+    }
+}
+
 fn large_world_coordinates(engine_major: u16) -> bool {
     engine_major >= 5
 }
@@ -329,7 +433,7 @@ fn read_struct_body(
 /// `pub(crate)`, not `pub(super)`: `rawdata` decoders (e.g. `PalCharacterData`) embed
 /// a GVAS property list inside an otherwise-opaque RawData blob and need this same
 /// walk, on their own byte slice rather than the save's.
-pub(crate) fn read_property_list(
+pub fn read_property_list(
     buf: &[u8],
     pos: &mut usize,
     has_property_guid: bool,

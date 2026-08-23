@@ -2,8 +2,15 @@
   import Dropzone from './lib/components/Dropzone.svelte';
   import Inspector from './lib/components/Inspector.svelte';
   import Guilds from './lib/components/Guilds.svelte';
+  import Players from './lib/components/Players.svelte';
   import { SaveClient } from './lib/worker/client';
-  import type { Diagnostics, GuildSummary, SaveError, SaveSummary } from './lib/save-types';
+  import type {
+    Diagnostics,
+    GuildSummary,
+    PlayerSummary,
+    SaveError,
+    SaveSummary,
+  } from './lib/save-types';
 
   // One worker for the app's lifetime. The save itself lives in wasm memory inside
   // it — deliberately not in any store here (CLAUDE.md's boundary rule).
@@ -13,7 +20,8 @@
   let summary = $state<SaveSummary | null>(null);
   let diagnostics = $state<Diagnostics | null>(null);
   let guilds = $state<GuildSummary[]>([]);
-  let tab = $state<'inspector' | 'guilds'>('inspector');
+  let players = $state<PlayerSummary[]>([]);
+  let tab = $state<'inspector' | 'players' | 'guilds'>('inspector');
   let busy = $state(false);
   let error = $state<SaveError | null>(null);
   let edited = $state(false);
@@ -29,6 +37,7 @@
       edited = false;
       diagnostics = await client.diagnostics();
       guilds = await loadGuilds();
+      players = await loadPlayers();
       tab = 'inspector';
     } catch (e) {
       error = e as SaveError;
@@ -39,12 +48,28 @@
     }
   }
 
-  /** A player save or LevelMeta has no group map — that's expected, not an error. */
+  /** Only a Level.sav has these maps. A player save or LevelMeta legitimately has
+   *  neither, so a structural miss yields an empty list rather than an error banner. */
+  const MISSING_MAP_CODES = ['no_group_map', 'not_a_level_save', 'map_not_found'];
+
+  function isMissingMap(e: unknown): boolean {
+    return MISSING_MAP_CODES.includes((e as SaveError)?.code);
+  }
+
   async function loadGuilds(): Promise<GuildSummary[]> {
     try {
       return await client.listGuilds();
     } catch (e) {
-      if ((e as SaveError).code === 'no_group_map') return [];
+      if (isMissingMap(e)) return [];
+      throw e;
+    }
+  }
+
+  async function loadPlayers(): Promise<PlayerSummary[]> {
+    try {
+      return await client.listPlayers();
+    } catch (e) {
+      if (isMissingMap(e)) return [];
       throw e;
     }
   }
@@ -79,6 +104,8 @@
     summary = null;
     diagnostics = null;
     guilds = [];
+    players = [];
+    tab = 'inspector';
     fileName = null;
     edited = false;
     error = null;
@@ -129,6 +156,13 @@
 
     <nav class="tabs">
       <button class:active={tab === 'inspector'} onclick={() => (tab = 'inspector')}>Inspector</button>
+      <button
+        class:active={tab === 'players'}
+        onclick={() => (tab = 'players')}
+        disabled={players.length === 0}
+      >
+        Players {players.length > 0 ? `(${players.length})` : ''}
+      </button>
       <button class:active={tab === 'guilds'} onclick={() => (tab = 'guilds')} disabled={guilds.length === 0}>
         Guilds {guilds.length > 0 ? `(${guilds.length})` : ''}
       </button>
@@ -136,6 +170,8 @@
 
     {#if tab === 'inspector'}
       <Inspector {summary} {diagnostics} />
+    {:else if tab === 'players'}
+      <Players {client} {players} />
     {:else}
       <Guilds {client} {guilds} onedited={refreshAfterEdit} />
     {/if}

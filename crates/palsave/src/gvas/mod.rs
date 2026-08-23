@@ -15,6 +15,7 @@
 pub mod error;
 pub mod header;
 pub mod hints;
+pub mod nav;
 pub mod primitives;
 pub mod property;
 pub mod value;

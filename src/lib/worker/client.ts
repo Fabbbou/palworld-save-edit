@@ -74,6 +74,18 @@ export class SaveClient {
     return this.#send({ id: this.#id(), kind: 'setGuildName', guildId, name });
   }
 
+  listPlayers() {
+    return this.#send({ id: this.#id(), kind: 'listPlayers' });
+  }
+
+  player(uid: string) {
+    return this.#send({ id: this.#id(), kind: 'player', uid });
+  }
+
+  palsOf(uid: string) {
+    return this.#send({ id: this.#id(), kind: 'palsOf', uid });
+  }
+
   diagnostics() {
     return this.#send({ id: this.#id(), kind: 'diagnostics' });
   }
