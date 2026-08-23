@@ -8,13 +8,20 @@ runtime. Your save is read into wasm memory in your own tab and never leaves it.
 
 ## Status
 
-Working: opening `.sav` files (including the current **PlM / Oodle** format that most
-existing open-source tools can't read), inspecting them, and renaming guilds. Exports
-download as a new file.
+Opens `.sav` files — including the current **PlM / Oodle** format that most existing
+open-source tools can't read — and exports edits as a new file.
 
-Not done yet: editing players/Pals or inventories (the decoders exist and round-trip
-against real saves, but nothing in the UI edits them yet), the raw property tree
-browser, and in-place write-back with automatic backup.
+**Reading:** the world's guilds and members; every player and Pal with stats, IVs and
+passive skills; each player's six inventories; their party and Pal box, showing which
+Pal is in which slot; per-item durability, loaded ammunition, and what's inside an egg.
+
+**Editing:** guild names, Pal stats (level, exp, the three IVs), Pal nicknames, and
+player level and exp.
+
+**Not yet:** editing inventory or Pal-box contents, migrating a player between saves,
+the raw property tree browser, and in-place write-back with automatic backup. Anything
+stored in `Players/<uid>.sav` is read-only for now — the export path only rewrites
+`Level.sav`.
 
 ## Development
 

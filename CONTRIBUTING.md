@@ -10,7 +10,8 @@ crates/palsave/       pure Rust core — no wasm-bindgen, testable with `cargo t
   src/edit/           splice engine
   src/guilds.rs       task-level API the wasm layer binds to
   src/bin/sniff.rs    native CLI: identify a .sav container without decompressing
-  examples/           dev tools for poking at real saves (inspect, drill, explore, …)
+  src/inventory.rs    two-file joins: items, and Pals by container
+  examples/           dev tools for poking at real saves (inspect, drill, dump_blobs, …)
 crates/palsave-wasm/  wasm-bindgen bindings — shim only, no logic
 src/                  Svelte 5 app
   lib/worker/         module worker hosting the wasm
@@ -37,6 +38,28 @@ npm run check                       # svelte-check / tsc
 
 `cargo run --bin sniff -- path/to/Level.sav` prints a save's container header without
 decompressing it. Useful first step when something won't open.
+
+## Working out an undecoded RawData layout
+
+`CLAUDE.md` says never guess a format detail. `examples/dump_blobs` is how you avoid
+having to — it hex-dumps blobs from any `worldSaveData` map or array and, more usefully,
+summarizes their sizes:
+
+```bash
+cargo run --example dump_blobs -p palsave -- fixtures/Level.sav map   SomeMapName
+cargo run --example dump_blobs -p palsave -- fixtures/Level.sav slots SomeMapName
+cargo run --example dump_blobs -p palsave -- fixtures/Level.sav array SomeArrayName
+cargo run --example dump_blobs -p palsave -- fixtures/Level.sav tails SomeArrayName
+```
+
+The size summary usually answers the first question on its own. "437 slots across two
+worlds, every one exactly 38 bytes" means a fixed-width record; a spread of lengths
+means something variable-length is embedded. `tails` strips a leading
+`Guid, Guid, FString` before measuring, which is what turns an apparently chaotic length
+distribution into a small set of payload shapes (see ADR-006.md).
+
+Run it against **every** world you have, not just one. A field that looks like a player
+uid in a one-player world is what ADR-006.md's closing note is about.
 
 ## Adding a fixture for a new game version
 
