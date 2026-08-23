@@ -3,6 +3,16 @@ name = "palsave"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Synthetic save builders + the gen-fixtures binary. Off by default so none of it
+# ships in the released wasm; enabled for palsave-wasm's dev-dependency so tests and
+# `clippy --all-targets` still see it.
+synthetic = []
+
+[[bin]]
+name = "gen-fixtures"
+required-features = ["synthetic"]
+
 [dependencies]
 flate2 = "1.1.9"
 oozextract = { version = "0.5.5", default-features = false }

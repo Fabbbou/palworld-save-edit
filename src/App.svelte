@@ -161,7 +161,7 @@
 
   {#if error}
     <p class="banner danger">
-      <code>{error.code}</code>
+      <code data-testid="error-code">{error.code}</code>
       {error.message}
     </p>
   {/if}
@@ -169,16 +169,16 @@
   {#if !summary}
     <Dropzone onfiles={openFiles} {busy} />
   {:else}
-    <div class="filebar">
+    <div class="filebar" data-testid="filebar">
       <div>
-        <strong>{fileName}</strong>
-        {#if edited}<span class="badge">unsaved changes</span>{/if}
+        <strong data-testid="filename">{fileName}</strong>
+        {#if edited}<span class="badge" data-testid="dirty">unsaved changes</span>{/if}
       </div>
       <div class="actions">
-        <button onclick={download} disabled={exporting} class="primary">
+        <button onclick={download} disabled={exporting} class="primary" data-testid="download">
           {exporting ? 'Preparing…' : 'Download .sav'}
         </button>
-        <button onclick={reset}>Close</button>
+        <button onclick={reset} data-testid="close">Close</button>
       </div>
     </div>
 
@@ -196,18 +196,19 @@
     {/if}
 
     <nav class="tabs">
-      <button class:active={tab === 'inspector'} onclick={() => (tab = 'inspector')}>Inspector</button>
+      <button class:active={tab === 'inspector'} onclick={() => (tab = 'inspector')} data-testid="tab-inspector">Inspector</button>
       <button
         class:active={tab === 'players'}
         onclick={() => (tab = 'players')}
+        data-testid="tab-players"
         disabled={players.length === 0}
       >
         Players {players.length > 0 ? `(${players.length})` : ''}
       </button>
-      <button class:active={tab === 'inventory'} onclick={() => (tab = 'inventory')}>
+      <button class:active={tab === 'inventory'} onclick={() => (tab = 'inventory')} data-testid="tab-inventory">
         Inventory {attachedPlayers.length > 0 ? `(${attachedPlayers.length})` : ''}
       </button>
-      <button class:active={tab === 'guilds'} onclick={() => (tab = 'guilds')} disabled={guilds.length === 0}>
+      <button class:active={tab === 'guilds'} onclick={() => (tab = 'guilds')} disabled={guilds.length === 0} data-testid="tab-guilds">
         Guilds {guilds.length > 0 ? `(${guilds.length})` : ''}
       </button>
     </nav>

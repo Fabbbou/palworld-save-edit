@@ -28,6 +28,7 @@
 </script>
 
 <div
+  data-testid="dropzone"
   class="dropzone"
   class:dragging
   class:busy
@@ -53,6 +54,7 @@
     accept=".sav"
     multiple
     hidden
+    data-testid="file-input"
     onchange={(e) => pick((e.currentTarget as HTMLInputElement).files)}
   />
   {#if busy}

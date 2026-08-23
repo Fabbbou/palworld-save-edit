@@ -146,7 +146,7 @@
           and aren't listed here.
         </p>
       {:else}
-        <div class="tablewrap">
+        <div class="tablewrap" data-testid="pals-table">
           <table>
             <thead>
               <tr>

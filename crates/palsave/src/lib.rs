@@ -5,4 +5,6 @@ pub mod guilds;
 pub mod gvas;
 pub mod inventory;
 pub mod rawdata;
+#[cfg(feature = "synthetic")]
+pub mod synthetic;
 pub mod world;

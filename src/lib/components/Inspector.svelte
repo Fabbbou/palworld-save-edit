@@ -17,7 +17,7 @@
 </script>
 
 <section>
-  <dl>
+  <dl data-testid="inspector-rows">
     {#each rows as [label, value] (label)}
       <div class="row">
         <dt>{label}</dt>

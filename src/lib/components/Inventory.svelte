@@ -67,7 +67,7 @@
 </script>
 
 {#if attachedPlayers.length === 0}
-  <div class="empty">
+  <div class="empty" data-testid="inventory-empty">
     <p><strong>No player save attached.</strong></p>
     <p class="muted">
       <code>Level.sav</code> holds every container in the world but doesn't record which
@@ -98,7 +98,7 @@
       {#if loading || !inventory}
         {#if !error}<p class="muted">Loading…</p>{/if}
       {:else}
-        <p class="muted summary">
+        <p class="muted summary" data-testid="inventory-summary">
           <span class="mono">{inventory.player_uid}</span> — {totalItems.toLocaleString()}
           items across {inventory.containers.length} containers
         </p>

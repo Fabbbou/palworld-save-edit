@@ -8,3 +8,6 @@ src/lib/wasm/
 # real save files: SteamIDs + player names, never commit
 /fixtures/*
 !/fixtures/README.md
+e2e/fixtures
+playwright-report/
+test-results/
