@@ -4,6 +4,7 @@ pub mod edit;
 pub mod guilds;
 pub mod gvas;
 pub mod inventory;
+pub mod migrate;
 pub mod rawdata;
 #[cfg(feature = "synthetic")]
 pub mod synthetic;

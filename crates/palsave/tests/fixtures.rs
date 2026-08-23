@@ -2262,6 +2262,191 @@ fn array_inner_tag_size_covers_all_element_bodies() {
     }
 }
 
+/// Pal instance ids are **not** globally unique across worlds.
+///
+/// This is the finding that decides migration's design, and it is deeply
+/// counter-intuitive: an `InstanceId` looks like a random guid, so the obvious
+/// assumption is that copying a Pal between worlds can never clash. It can. Two
+/// unrelated worlds — different players, different guilds, different save folders —
+/// share instance ids, and the Pals wearing them are *the same species* with different
+/// levels and different owners.
+///
+/// The most plausible reading is that world-placed Pals get an id derived from
+/// something deterministic (a spawn point on a map both worlds share), and keep it once
+/// caught. Whatever the mechanism, the consequence is fixed: a migration that copies
+/// Pal rows verbatim will sooner or later produce a world with two characters sharing
+/// an instance id, and nothing downstream would notice.
+///
+/// So this test exists to keep the fact visible. If it ever starts finding zero
+/// overlaps, the assumption changed and `migrate`'s conflict handling can be revisited
+/// — but until then, id remapping is not optional.
+#[test]
+fn pal_instance_ids_collide_across_unrelated_worlds() {
+    use palsave::characters;
+    use std::collections::BTreeMap;
+
+    let levels = level_fixtures();
+    if levels.len() < 2 {
+        eprintln!("need two worlds, skipping");
+        return;
+    }
+
+    // instance id -> (world label, species)
+    let mut seen: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
+    let mut overlaps = 0usize;
+
+    for level in &levels {
+        let container = palsave::container::decode(&std::fs::read(level).unwrap()).unwrap();
+        let label = level.display().to_string();
+        for pal in characters::list_all_pals(&container.gvas).unwrap() {
+            if let Some((other_label, other_species)) = seen.get(&pal.instance_id) {
+                if other_label != &label {
+                    overlaps += 1;
+                    // Same id in two worlds should at least mean the same creature; if
+                    // the species differed, the ids would be pure coincidence rather
+                    // than derived from anything, and the story above would be wrong.
+                    assert_eq!(
+                        other_species, &pal.character_id,
+                        "instance {} is {:?} in one world and {:?} in another",
+                        pal.instance_id, other_species, pal.character_id
+                    );
+                    eprintln!(
+                        "  shared instance {}: {:?}",
+                        pal.instance_id, pal.character_id
+                    );
+                }
+            } else {
+                seen.insert(pal.instance_id.clone(), (label.clone(), pal.character_id));
+            }
+        }
+    }
+
+    assert!(
+        overlaps > 0,
+        "no instance ids shared between worlds — if this is now true, migration's \
+         collision handling can be simplified, but verify before assuming it"
+    );
+    eprintln!("{overlaps} Pal instance id(s) shared across unrelated worlds");
+}
+
+/// The migration survey, run between the two real worlds.
+///
+/// The corpus happens to be the hard case: the same player uid exists in both worlds,
+/// so a migration between them is exactly the identity collision that would silently
+/// produce a world with two of the same player. The survey has to see it.
+#[test]
+fn migration_plan_finds_the_rows_and_the_collisions() {
+    use palsave::migrate::{self, Conflict};
+
+    let worlds = worlds_with_players();
+    let complete: Vec<_> = worlds.iter().filter(|(_, p)| !p.is_empty()).collect();
+    if complete.len() < 2 {
+        eprintln!("need two worlds with player saves, skipping");
+        return;
+    }
+
+    // Every ordered pair, so the survey is exercised in both directions.
+    for (source_path, source_players) in &complete {
+        for (target_path, _) in &complete {
+            if source_path == target_path {
+                continue;
+            }
+            let source = palsave::container::decode(&std::fs::read(source_path).unwrap()).unwrap();
+            let target = palsave::container::decode(&std::fs::read(target_path).unwrap()).unwrap();
+
+            for player_path in source_players.iter() {
+                let player =
+                    palsave::container::decode(&std::fs::read(player_path).unwrap()).unwrap();
+                let uid = palsave::inventory::player_uid(&player.gvas).unwrap();
+
+                let plan = migrate::plan(&source.gvas, &player.gvas, &target.gvas, &uid).unwrap();
+
+                assert_eq!(plan.player_uid, uid);
+
+                // A migration that moves almost nothing is a broken survey, not a
+                // player with few belongings: everyone has containers and a Pal or two.
+                assert!(
+                    !plan.pal_entry_indices.is_empty(),
+                    "{}/{uid}: no Pals found to migrate",
+                    source_path.display()
+                );
+                assert!(
+                    !plan.item_container_indices.is_empty(),
+                    "{}/{uid}: no item containers found",
+                    source_path.display()
+                );
+                assert_eq!(
+                    plan.pal_container_indices.len(),
+                    2,
+                    "{}/{uid}: expected a party and a box",
+                    source_path.display()
+                );
+
+                // The Pals it plans to move must be exactly the ones ownership says are
+                // theirs — the same cross-check the Pal box screen relies on.
+                let owned = palsave::characters::pals_of(&source.gvas, &uid).unwrap();
+                assert_eq!(
+                    plan.pal_entry_indices.len(),
+                    owned.len(),
+                    "{}/{uid}: plan moves {} Pals but the player owns {}",
+                    source_path.display(),
+                    plan.pal_entry_indices.len(),
+                    owned.len()
+                );
+
+                // Indices must be distinct; a repeat would copy a row twice.
+                let mut sorted = plan.pal_entry_indices.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                assert_eq!(sorted.len(), plan.pal_entry_indices.len());
+                assert!(!plan.pal_entry_indices.contains(&plan.player_entry_index));
+
+                let blocking: Vec<&Conflict> = plan.blocking_conflicts().collect();
+                for c in &blocking {
+                    eprintln!("    conflict: {}", c.code());
+                }
+                eprintln!(
+                    "{} -> {} / {uid}: {} rows ({} pals, {} item containers, {} pal \
+                     containers, {} dynamic items), {} blocking conflict(s), guild {}",
+                    source_path.display(),
+                    target_path.display(),
+                    plan.row_count(),
+                    plan.pal_entry_indices.len(),
+                    plan.item_container_indices.len(),
+                    plan.pal_container_indices.len(),
+                    plan.dynamic_item_indices.len(),
+                    blocking.len(),
+                    if plan
+                        .conflicts
+                        .iter()
+                        .any(|c| matches!(c, Conflict::GuildMissing { .. }))
+                    {
+                        "missing"
+                    } else {
+                        "present"
+                    }
+                );
+
+                // A player who exists in both worlds must be reported as a collision.
+                // Silently overwriting them is the failure this whole module exists to
+                // prevent.
+                let target_has = palsave::characters::list_players(&target.gvas)
+                    .unwrap()
+                    .iter()
+                    .any(|p| p.uid == uid);
+                assert_eq!(
+                    target_has,
+                    plan.conflicts
+                        .iter()
+                        .any(|c| matches!(c, Conflict::PlayerExists { .. })),
+                    "{}/{uid}: PlayerExists conflict disagrees with the target's roster",
+                    target_path.display()
+                );
+            }
+        }
+    }
+}
+
 /// Guild members and players must agree on what a uid looks like.
 ///
 /// They did not. `guilds.rs` carried its own copy of `guid_to_hex` that was never
