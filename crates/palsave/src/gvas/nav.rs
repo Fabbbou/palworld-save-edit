@@ -171,8 +171,14 @@ impl<'a> Cursor<'a> {
 /// and Unreal's field order versus RFC-4122's is its own source of confusion.
 pub fn guid_to_hex(guid: &Guid) -> String {
     let mut s = String::with_capacity(32);
-    for group in guid.chunks_exact(4) {
-        let value = u32::from_le_bytes([group[0], group[1], group[2], group[3]]);
+    for group in 0..4 {
+        let start = group * 4;
+        let value = u32::from_le_bytes([
+            guid[start],
+            guid[start + 1],
+            guid[start + 2],
+            guid[start + 3],
+        ]);
         s.push_str(&format!("{value:08x}"));
     }
     s
