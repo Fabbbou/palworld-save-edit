@@ -238,6 +238,13 @@ struct SlotView {
     slot_index: i32,
     count: i32,
     static_id: Option<String>,
+    /// From the slot's `DynamicItemSaveData` row. Absent for most items — a stack of
+    /// Wood has no per-instance state — so the UI must read `null` as "not applicable"
+    /// rather than "unknown".
+    durability: Option<f32>,
+    remaining_bullets: Option<i32>,
+    ammo_static_id: Option<String>,
+    egg_character_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -253,6 +260,31 @@ struct ContainerView {
 struct PlayerInventoryView {
     player_uid: String,
     containers: Vec<ContainerView>,
+}
+
+/// One Pal-box or party slot. `pal` reuses [`PalSummaryView`] rather than defining a
+/// slimmer shape, because it is literally the same Pal the Players screen shows — the
+/// join goes through `characters::list_all_pals`, so the two screens read one decoder.
+#[derive(Serialize)]
+struct PalSlotView {
+    slot_index: i32,
+    instance_id: String,
+    pal: Option<PalSummaryView>,
+}
+
+#[derive(Serialize)]
+struct PalContainerView {
+    kind: &'static str,
+    id: String,
+    slot_count: i32,
+    slots: Vec<PalSlotView>,
+    missing: bool,
+}
+
+#[derive(Serialize)]
+struct PlayerPalStorageView {
+    player_uid: String,
+    containers: Vec<PalContainerView>,
 }
 
 /// A report a user can attach to a bug report. Deliberately carries **no** personal
@@ -517,6 +549,48 @@ impl SaveHandle {
                             slot_index: s.slot_index,
                             count: s.count,
                             static_id: s.static_id.clone(),
+                            durability: s.durability,
+                            remaining_bullets: s.remaining_bullets,
+                            ammo_static_id: s.ammo_static_id.clone(),
+                            egg_character_id: s.egg_character_id.clone(),
+                        })
+                        .collect(),
+                    missing: c.missing,
+                })
+                .collect(),
+        })
+    }
+
+    /// A player's Pal box and party. Needs the same two-file pairing as
+    /// `playerInventory` — the container ids live in the player's own save.
+    #[wasm_bindgen(js_name = playerPalStorage)]
+    pub fn player_pal_storage(&self, uid: &str) -> Result<JsValue, JsValue> {
+        let player = self.players.get(uid).ok_or_else(|| {
+            js_error(
+                "player_save_not_attached",
+                format!("no player save attached for {uid}"),
+            )
+        })?;
+
+        let storage = inventory::player_pal_storage(&self.container.gvas, &player.gvas)
+            .map_err(inventory_error)?;
+
+        to_js(&PlayerPalStorageView {
+            player_uid: storage.player_uid,
+            containers: storage
+                .containers
+                .iter()
+                .map(|c| PalContainerView {
+                    kind: c.kind.as_str(),
+                    id: c.id.clone(),
+                    slot_count: c.slot_count,
+                    slots: c
+                        .slots
+                        .iter()
+                        .map(|s| PalSlotView {
+                            slot_index: s.slot_index,
+                            instance_id: s.instance_id.clone(),
+                            pal: s.pal.as_ref().map(PalSummaryView::from),
                         })
                         .collect(),
                     missing: c.missing,

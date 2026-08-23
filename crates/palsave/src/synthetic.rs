@@ -3,9 +3,16 @@
 //! Real saves are gitignored — they carry SteamIDs and player names — so anything
 //! that needs a `.sav` in CI (the wasm boundary tests, the browser end-to-end suite)
 //! has to construct one. These builders emit **structurally real** files: a proper
-//! GVAS header, a `worldSaveData` holding a guild, a character-map entry and an item
-//! container, plus a matching player save. Built inner-to-outer so every `size` field
-//! is exact, which is what makes them useful as parser input rather than just bytes.
+//! GVAS header, a `worldSaveData` holding a guild, a player, a Pal, an item container,
+//! two Pal containers and a dynamic-item row, plus a matching player save. Built
+//! inner-to-outer so every `size` field is exact, which is what makes them useful as
+//! parser input rather than just bytes.
+//!
+//! The contents are chosen so every join in the crate has something to resolve: the
+//! Pal is in the Pal box *and* names the player as owner, and the item slot's
+//! `DynamicId` is non-zero so the durability lookup is exercised rather than
+//! short-circuited by the "no per-instance state" sentinel. A fixture where the joins
+//! trivially return nothing would let a broken decoder pass.
 //!
 //! Behind the `synthetic` feature so none of it ships in the released wasm. The
 //! feature is enabled for `palsave-wasm`'s dev-dependency, so `cargo test` and
@@ -15,7 +22,7 @@ use crate::container::{self, Algorithm, Container, Passes};
 use crate::gvas::header::{GVAS_MAGIC, Header};
 use crate::gvas::primitives::{FString, write_fstring, write_i32_le, write_u32_le};
 use crate::gvas::property::{PropertyTag, TagExtra, none_terminator, write_property_tag};
-use crate::rawdata::{group, item_container};
+use crate::rawdata::{character_container, dynamic_item, group, item_container};
 
 /// Obviously-synthetic: this is test data, not a GUID lifted from a real save.
 pub const GUILD_ID: [u8; 16] = [
@@ -126,6 +133,16 @@ pub const PLAYER_INSTANCE_ID: [u8; 16] = [0x77; 16];
 /// The container the synthetic player's InventoryInfo points at, and the key of the
 /// one entry in the synthetic level's ItemContainerSaveData. The join under test.
 pub const CONTAINER_ID: [u8; 16] = [0x42; 16];
+/// The one Pal in the synthetic world. Sits in the Pal box *and* names the player as
+/// owner, so both routes to "whose Pal is this" resolve to it.
+pub const PAL_INSTANCE_ID: [u8; 16] = [0x55; 16];
+/// Keys of the two `CharacterContainerSaveData` entries the player's save points at.
+pub const PAL_STORAGE_CONTAINER_ID: [u8; 16] = [0x43; 16];
+pub const PAL_PARTY_CONTAINER_ID: [u8; 16] = [0x44; 16];
+/// The `DynamicItemSaveData` row the synthetic item slot references. Non-zero on
+/// purpose: an all-zero id is the "no dynamic state" sentinel and would exercise
+/// nothing.
+pub const DYNAMIC_ITEM_LOCAL_ID: [u8; 16] = [0x66; 16];
 
 /// A `SaveParameter` property list for a player: the `IsPlayer` flag that classifies
 /// the entry, plus a couple of stats to prove values survive the crossing.
@@ -215,19 +232,121 @@ fn player_raw_data() -> Vec<u8> {
     blob
 }
 
-/// One `CharacterSaveParameterMap` entry. The key carries the PlayerUId, which is
-/// where `characters::list_players` reads the uid from — not the value.
-fn character_map_value() -> Vec<u8> {
+/// A `SaveParameter` for a Pal: no `IsPlayer` flag, an owner, a species and IVs. The
+/// owner is what `characters::pals_of` reads, so a Pal built this way is reachable
+/// both through ownership and through the Pal box — the two paths
+/// `pal_storage_agrees_with_ownership` compares.
+fn pal_save_parameter() -> Vec<u8> {
+    let mut out = Vec::new();
+
+    let character_id = {
+        let mut v = Vec::new();
+        write_fstring(&mut v, &ascii("Lamball"));
+        v
+    };
+    write_property_tag(
+        &mut out,
+        &PropertyTag {
+            name: ascii("CharacterID"),
+            type_name: ascii("NameProperty"),
+            size: character_id.len() as u32,
+            index: 0,
+            extra: TagExtra::None,
+            guid: None,
+        },
+        true,
+    );
+    out.extend_from_slice(&character_id);
+
+    write_property_tag(
+        &mut out,
+        &PropertyTag {
+            name: ascii("Level"),
+            type_name: ascii("ByteProperty"),
+            size: 1,
+            index: 0,
+            extra: TagExtra::Byte {
+                enum_type: ascii("None"),
+            },
+            guid: None,
+        },
+        true,
+    );
+    out.push(12);
+
+    write_property_tag(
+        &mut out,
+        &PropertyTag {
+            name: ascii("Talent_HP"),
+            type_name: ascii("ByteProperty"),
+            size: 1,
+            index: 0,
+            extra: TagExtra::Byte {
+                enum_type: ascii("None"),
+            },
+            guid: None,
+        },
+        true,
+    );
+    out.push(70);
+
+    write_property_tag(
+        &mut out,
+        &PropertyTag {
+            name: ascii("OwnerPlayerUId"),
+            type_name: ascii("StructProperty"),
+            size: 16,
+            index: 0,
+            extra: TagExtra::Struct {
+                struct_type: ascii("Guid"),
+                guid: [0u8; 16],
+            },
+            guid: None,
+        },
+        true,
+    );
+    out.extend_from_slice(&PLAYER_UID);
+
+    write_fstring(&mut out, &none_terminator());
+    out
+}
+
+/// Wraps a `SaveParameter` list into the `PalCharacterData` RawData blob shape.
+fn character_raw_data(save_parameter: Vec<u8>) -> Vec<u8> {
+    let mut object = Vec::new();
+    write_property_tag(
+        &mut object,
+        &PropertyTag {
+            name: ascii("SaveParameter"),
+            type_name: ascii("StructProperty"),
+            size: save_parameter.len() as u32,
+            index: 0,
+            extra: TagExtra::Struct {
+                struct_type: ascii("PalIndividualCharacterSaveParameter"),
+                guid: [0u8; 16],
+            },
+            guid: None,
+        },
+        true,
+    );
+    object.extend_from_slice(&save_parameter);
+    write_fstring(&mut object, &none_terminator());
+
+    let mut blob = object;
+    blob.extend_from_slice(&[0, 0, 0, 0]); // unknown_bytes
+    blob.extend_from_slice(&GUILD_ID); // group_id
+    blob.extend_from_slice(&[0, 0, 0, 0]); // trailing_bytes
+    blob
+}
+
+/// One `CharacterSaveParameterMap` entry body: the key property list, then the value
+/// holding the RawData blob.
+fn character_map_entry(player_uid: [u8; 16], instance_id: [u8; 16], blob: Vec<u8>) -> Vec<u8> {
     let mut v = Vec::new();
-    write_u32_le(&mut v, 0); // keys-to-remove count
-    write_u32_le(&mut v, 1); // entry count
 
     // Key: a property list (PlayerUId + InstanceId), per gvas::hints.
     let mut key = Vec::new();
-    for (name, guid) in [
-        ("PlayerUId", PLAYER_UID),
-        ("InstanceId", PLAYER_INSTANCE_ID),
-    ] {
+    for (name, guid) in [("PlayerUId", player_uid), ("InstanceId", instance_id)] {
         write_property_tag(
             &mut key,
             &PropertyTag {
@@ -249,7 +368,6 @@ fn character_map_value() -> Vec<u8> {
     v.extend_from_slice(&key);
 
     // Value: a property list holding the RawData blob.
-    let blob = player_raw_data();
     let raw_value = {
         let mut r = Vec::new();
         write_u32_le(&mut r, blob.len() as u32);
@@ -278,13 +396,66 @@ fn character_map_value() -> Vec<u8> {
     v
 }
 
+/// `CharacterSaveParameterMap`: the player, plus one Pal that sits in their Pal box.
+///
+/// A Pal is not optional decoration here. Without one the Pal-box join has nothing to
+/// resolve to, and a test asserting "the box is readable" would pass against a decoder
+/// that returns nothing.
+fn character_map_value() -> Vec<u8> {
+    let mut v = Vec::new();
+    write_u32_le(&mut v, 0); // keys-to-remove count
+    write_u32_le(&mut v, 2); // entry count
+
+    v.extend_from_slice(&character_map_entry(
+        PLAYER_UID,
+        PLAYER_INSTANCE_ID,
+        player_raw_data(),
+    ));
+    // A Pal's map key carries a zero PlayerUId — ownership lives in the RawData.
+    v.extend_from_slice(&character_map_entry(
+        [0u8; 16],
+        PAL_INSTANCE_ID,
+        character_raw_data(pal_save_parameter()),
+    ));
+
+    v
+}
+
 /// One `ItemContainerSaveData` entry holding a single occupied slot.
+///
+/// The slot's `DynamicId` is non-zero and matches [`dynamic_item_array_value`], so the
+/// durability join has something to resolve. An all-zero id — the "no per-instance
+/// state" sentinel — would leave that path untested.
 fn item_container_map_value() -> Vec<u8> {
     let mut v = Vec::new();
     write_u32_le(&mut v, 0); // keys-to-remove count
     write_u32_le(&mut v, 1); // entry count
 
-    // Key: { ID: Guid }
+    v.extend_from_slice(&container_key(CONTAINER_ID));
+
+    let slot_blob = item_container::encode_slot(&item_container::ItemContainerSlot {
+        slot_index: 0,
+        count: 5,
+        item: item_container::ItemId {
+            static_id: ascii("ClothArmor"),
+            dynamic_id: item_container::DynamicId {
+                created_world_id: [0u8; 16],
+                local_id_in_created_world: DYNAMIC_ITEM_LOCAL_ID,
+            },
+        },
+        trailing_bytes: Vec::new(),
+    });
+    v.extend_from_slice(&container_value(
+        &raw_data_property(&slot_blob),
+        "PalItemSlotSaveData",
+        42,
+    ));
+
+    v
+}
+
+/// A `{ID: Guid}` map key, the shape both container maps use.
+fn container_key(id: [u8; 16]) -> Vec<u8> {
     let mut key = Vec::new();
     write_property_tag(
         &mut key,
@@ -301,36 +472,26 @@ fn item_container_map_value() -> Vec<u8> {
         },
         true,
     );
-    key.extend_from_slice(&CONTAINER_ID);
+    key.extend_from_slice(&id);
     write_fstring(&mut key, &none_terminator());
-    v.extend_from_slice(&key);
+    key
+}
 
-    // One slot body: a property list carrying the slot's RawData blob.
-    let slot_blob = item_container::encode_slot(&item_container::ItemContainerSlot {
-        slot_index: 0,
-        count: 5,
-        item: item_container::ItemId {
-            static_id: ascii("Wood"),
-            dynamic_id: item_container::DynamicId {
-                created_world_id: [0u8; 16],
-                local_id_in_created_world: [0u8; 16],
-            },
-        },
-        trailing_bytes: Vec::new(),
-    });
-    let slot_raw_value = {
+/// Wraps a rawdata blob as a `RawData` ArrayProperty inside a property list.
+fn raw_data_property(blob: &[u8]) -> Vec<u8> {
+    let raw_value = {
         let mut r = Vec::new();
-        write_u32_le(&mut r, slot_blob.len() as u32);
-        r.extend_from_slice(&slot_blob);
+        write_u32_le(&mut r, blob.len() as u32);
+        r.extend_from_slice(blob);
         r
     };
-    let mut slot_body = Vec::new();
+    let mut body = Vec::new();
     write_property_tag(
-        &mut slot_body,
+        &mut body,
         &PropertyTag {
             name: ascii("RawData"),
             type_name: ascii("ArrayProperty"),
-            size: slot_raw_value.len() as u32,
+            size: raw_value.len() as u32,
             index: 0,
             extra: TagExtra::Array {
                 inner_type: ascii("ByteProperty"),
@@ -339,9 +500,13 @@ fn item_container_map_value() -> Vec<u8> {
         },
         true,
     );
-    slot_body.extend_from_slice(&slot_raw_value);
-    write_fstring(&mut slot_body, &none_terminator());
+    body.extend_from_slice(&raw_value);
+    write_fstring(&mut body, &none_terminator());
+    body
+}
 
+/// A container value: `Slots` (array of one body) plus `SlotNum`.
+fn container_value(slot_body: &[u8], struct_type: &str, slot_num: i32) -> Vec<u8> {
     // Slots: ArrayProperty<StructProperty>. The element tag is written once, before
     // the bodies — and is present even for a zero-length array (see ADR-003.md).
     let slots_value = {
@@ -355,14 +520,14 @@ fn item_container_map_value() -> Vec<u8> {
                 size: slot_body.len() as u32,
                 index: 0,
                 extra: TagExtra::Struct {
-                    struct_type: ascii("PalItemSlotSaveData"),
+                    struct_type: ascii(struct_type),
                     guid: [0u8; 16],
                 },
                 guid: None,
             },
             true,
         );
-        a.extend_from_slice(&slot_body);
+        a.extend_from_slice(slot_body);
         a
     };
 
@@ -395,53 +560,129 @@ fn item_container_map_value() -> Vec<u8> {
         },
         true,
     );
-    write_i32_le(&mut value, 42);
+    write_i32_le(&mut value, slot_num);
     write_fstring(&mut value, &none_terminator());
-    v.extend_from_slice(&value);
+    value
+}
 
+/// `CharacterContainerSaveData`: the player's Pal box (holding the one Pal) and their
+/// party (empty capacity, so the "container resolves but is empty" path is exercised
+/// too).
+fn pal_container_map_value() -> Vec<u8> {
+    let mut v = Vec::new();
+    write_u32_le(&mut v, 0); // keys-to-remove count
+    write_u32_le(&mut v, 2); // entry count
+
+    let occupied = character_container::encode_slot(&character_container::PalContainerSlot {
+        leading_bytes: PLAYER_UID,
+        instance_id: PAL_INSTANCE_ID,
+        trailing_bytes: vec![0; 6],
+    });
+    v.extend_from_slice(&container_key(PAL_STORAGE_CONTAINER_ID));
+    v.extend_from_slice(&container_value(
+        &raw_data_property(&occupied),
+        "PalContainerCharacterSlotSaveData",
+        960,
+    ));
+
+    // The party slot points at the same Pal. That is not how a real save looks, but it
+    // keeps the fixture to one Pal while still proving both containers resolve — and a
+    // test that cares would compare instance ids, which are identical either way.
+    v.extend_from_slice(&container_key(PAL_PARTY_CONTAINER_ID));
+    v.extend_from_slice(&container_value(
+        &raw_data_property(&occupied),
+        "PalContainerCharacterSlotSaveData",
+        5,
+    ));
+
+    v
+}
+
+/// `DynamicItemSaveData`: one row, matching the id on the synthetic item slot.
+fn dynamic_item_array_value() -> Vec<u8> {
+    let blob = dynamic_item::encode(&dynamic_item::DynamicItem {
+        id: item_container::DynamicId {
+            created_world_id: [0u8; 16],
+            local_id_in_created_world: DYNAMIC_ITEM_LOCAL_ID,
+        },
+        static_id: ascii("ClothArmor"),
+        payload: dynamic_item::DynamicItemPayload::Durability {
+            unknown_0: 0,
+            durability: 150.0,
+            remaining_bullets: 0,
+        },
+    });
+    let element = raw_data_property(&blob);
+
+    let mut v = Vec::new();
+    write_u32_le(&mut v, 1); // element count
+    write_property_tag(
+        &mut v,
+        &PropertyTag {
+            name: ascii("DynamicItemSaveData"),
+            type_name: ascii("StructProperty"),
+            size: element.len() as u32,
+            index: 0,
+            extra: TagExtra::Struct {
+                struct_type: ascii("PalDynamicItemSaveData"),
+                guid: [0u8; 16],
+            },
+            guid: None,
+        },
+        true,
+    );
+    v.extend_from_slice(&element);
     v
 }
 
 /// A `Players/<uid>.sav`: the save class that identifies it, plus the `SaveData`
 /// holding the player's uid and the container ids that make an inventory resolvable.
 pub fn synthetic_player_sav() -> Vec<u8> {
-    // InventoryInfo.CommonContainerId = { ID: Guid }
-    let mut container_id_value = Vec::new();
-    write_property_tag(
-        &mut container_id_value,
-        &PropertyTag {
-            name: ascii("ID"),
-            type_name: ascii("StructProperty"),
-            size: 16,
-            index: 0,
-            extra: TagExtra::Struct {
-                struct_type: ascii("Guid"),
-                guid: [0u8; 16],
+    // A `<Name>ContainerId` is a struct wrapping a single `ID` guid — the same shape
+    // whether it names an item container or a Pal container.
+    let container_id_struct = |id: [u8; 16]| {
+        let mut value = Vec::new();
+        write_property_tag(
+            &mut value,
+            &PropertyTag {
+                name: ascii("ID"),
+                type_name: ascii("StructProperty"),
+                size: 16,
+                index: 0,
+                extra: TagExtra::Struct {
+                    struct_type: ascii("Guid"),
+                    guid: [0u8; 16],
+                },
+                guid: None,
             },
-            guid: None,
-        },
-        true,
-    );
-    container_id_value.extend_from_slice(&CONTAINER_ID);
-    write_fstring(&mut container_id_value, &none_terminator());
+            true,
+        );
+        value.extend_from_slice(&id);
+        write_fstring(&mut value, &none_terminator());
+        value
+    };
+    let write_container_id = |out: &mut Vec<u8>, name: &str, id: [u8; 16]| {
+        let body = container_id_struct(id);
+        write_property_tag(
+            out,
+            &PropertyTag {
+                name: ascii(name),
+                type_name: ascii("StructProperty"),
+                size: body.len() as u32,
+                index: 0,
+                extra: TagExtra::Struct {
+                    struct_type: ascii("PalContainerId"),
+                    guid: [0u8; 16],
+                },
+                guid: None,
+            },
+            true,
+        );
+        out.extend_from_slice(&body);
+    };
 
     let mut inventory_info = Vec::new();
-    write_property_tag(
-        &mut inventory_info,
-        &PropertyTag {
-            name: ascii("CommonContainerId"),
-            type_name: ascii("StructProperty"),
-            size: container_id_value.len() as u32,
-            index: 0,
-            extra: TagExtra::Struct {
-                struct_type: ascii("PalContainerId"),
-                guid: [0u8; 16],
-            },
-            guid: None,
-        },
-        true,
-    );
-    inventory_info.extend_from_slice(&container_id_value);
+    write_container_id(&mut inventory_info, "CommonContainerId", CONTAINER_ID);
     write_fstring(&mut inventory_info, &none_terminator());
 
     let mut save_data = Vec::new();
@@ -477,6 +718,20 @@ pub fn synthetic_player_sav() -> Vec<u8> {
         true,
     );
     save_data.extend_from_slice(&inventory_info);
+
+    // Pal containers sit at SaveData top level, not under InventoryInfo — the
+    // distinction `inventory::PAL_CONTAINER_KINDS` exists for.
+    write_container_id(
+        &mut save_data,
+        "OtomoCharacterContainerId",
+        PAL_PARTY_CONTAINER_ID,
+    );
+    write_container_id(
+        &mut save_data,
+        "PalStorageContainerId",
+        PAL_STORAGE_CONTAINER_ID,
+    );
+
     write_fstring(&mut save_data, &none_terminator());
 
     let mut gvas = Vec::new();
@@ -591,6 +846,41 @@ pub fn synthetic_sav() -> Vec<u8> {
             true,
         );
         v.extend_from_slice(&item_value);
+
+        let pal_container_value = pal_container_map_value();
+        write_property_tag(
+            &mut v,
+            &PropertyTag {
+                name: ascii("CharacterContainerSaveData"),
+                type_name: ascii("MapProperty"),
+                size: pal_container_value.len() as u32,
+                index: 0,
+                extra: TagExtra::Map {
+                    key_type: ascii("StructProperty"),
+                    value_type: ascii("StructProperty"),
+                },
+                guid: None,
+            },
+            true,
+        );
+        v.extend_from_slice(&pal_container_value);
+
+        let dynamic_value = dynamic_item_array_value();
+        write_property_tag(
+            &mut v,
+            &PropertyTag {
+                name: ascii("DynamicItemSaveData"),
+                type_name: ascii("ArrayProperty"),
+                size: dynamic_value.len() as u32,
+                index: 0,
+                extra: TagExtra::Array {
+                    inner_type: ascii("StructProperty"),
+                },
+                guid: None,
+            },
+            true,
+        );
+        v.extend_from_slice(&dynamic_value);
 
         write_fstring(&mut v, &none_terminator());
         v

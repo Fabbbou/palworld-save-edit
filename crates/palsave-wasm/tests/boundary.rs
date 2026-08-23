@@ -130,11 +130,17 @@ fn players_and_pals_cross_the_boundary() {
     let detail = handle.player(&uid).expect("player");
     let summary = get(&detail, "summary");
     assert_eq!(get(&summary, "nickname").as_string().unwrap(), "Tester");
-    // This synthetic save has no Pals, so the roster is empty rather than absent.
-    assert_eq!(js_sys::Array::from(&get(&detail, "pals")).length(), 0);
+    // The synthetic world holds one Pal, and it names this player as its owner.
+    let pals = js_sys::Array::from(&get(&detail, "pals"));
+    assert_eq!(pals.length(), 1);
+    assert_eq!(
+        get(&pals.get(0), "character_id").as_string().unwrap(),
+        "Lamball"
+    );
+    assert_eq!(get(&pals.get(0), "talent_hp").as_f64().unwrap(), 70.0);
     assert_eq!(
         js_sys::Array::from(&handle.pals_of(&uid).expect("palsOf")).length(),
-        0
+        1
     );
 }
 
@@ -171,14 +177,72 @@ fn attaching_a_player_save_resolves_their_inventory() {
     let slots = js_sys::Array::from(&get(&common, "slots"));
     assert_eq!(slots.length(), 1);
     let slot = slots.get(0);
-    assert_eq!(get(&slot, "static_id").as_string().unwrap(), "Wood");
+    assert_eq!(get(&slot, "static_id").as_string().unwrap(), "ClothArmor");
     assert_eq!(get(&slot, "count").as_f64().unwrap(), 5.0);
+    // The DynamicItemSaveData join, all the way across the boundary. The slot's
+    // DynamicId is non-zero in the fixture precisely so this can't pass by returning
+    // the "no per-instance state" null.
+    assert_eq!(get(&slot, "durability").as_f64().unwrap(), 150.0);
 
     // Detaching really removes it.
     handle.detach_player_save(&uid);
     assert_eq!(
         js_sys::Array::from(&handle.attached_players().unwrap()).length(),
         0
+    );
+}
+
+/// The Pal-box join across the boundary, including the third hop: a slot's instance id
+/// must come back as a whole Pal, not just an id.
+#[wasm_bindgen_test]
+fn attaching_a_player_save_resolves_their_pal_storage() {
+    let mut handle = open(&synthetic_sav()).expect("open level");
+    let uid = handle
+        .attach_player_save(&synthetic_player_sav())
+        .expect("attachPlayerSave");
+
+    let storage = handle.player_pal_storage(&uid).expect("playerPalStorage");
+    assert_eq!(get(&storage, "player_uid").as_string().unwrap(), uid);
+
+    let containers = js_sys::Array::from(&get(&storage, "containers"));
+    assert_eq!(containers.length(), 2, "party and storage");
+
+    // PAL_CONTAINER_KINDS order: party first, then the box.
+    let party = containers.get(0);
+    assert_eq!(get(&party, "kind").as_string().unwrap(), "party");
+    assert_eq!(get(&party, "slot_count").as_f64().unwrap(), 5.0);
+
+    let box_ = containers.get(1);
+    assert_eq!(get(&box_, "kind").as_string().unwrap(), "storage");
+    assert_eq!(get(&box_, "slot_count").as_f64().unwrap(), 960.0);
+    assert!(!get(&box_, "missing").as_bool().unwrap());
+
+    let slots = js_sys::Array::from(&get(&box_, "slots"));
+    assert_eq!(slots.length(), 1);
+    let slot = slots.get(0);
+    assert_eq!(get(&slot, "slot_index").as_f64().unwrap(), 0.0);
+
+    // The join resolved to the actual Pal, not merely to an id string.
+    let pal = get(&slot, "pal");
+    assert!(!pal.is_null(), "slot did not resolve to a Pal");
+    assert_eq!(get(&pal, "character_id").as_string().unwrap(), "Lamball");
+    assert_eq!(get(&pal, "level").as_f64().unwrap(), 12.0);
+    assert_eq!(
+        get(&pal, "instance_id").as_string().unwrap(),
+        get(&slot, "instance_id").as_string().unwrap()
+    );
+}
+
+/// Reading a Pal box needs the player's own save, exactly like reading an inventory.
+#[wasm_bindgen_test]
+fn pal_storage_without_an_attached_player_save_is_refused() {
+    let handle = open(&synthetic_sav()).expect("open");
+    let err = handle
+        .player_pal_storage("00000000000000000000000000000001")
+        .unwrap_err();
+    assert_eq!(
+        get(&err, "code").as_string().unwrap(),
+        "player_save_not_attached"
     );
 }
 
@@ -195,8 +259,9 @@ fn diagnostic_report_carries_no_personal_data() {
         .as_string()
         .unwrap();
 
-    // Names the synthetic save is known to contain.
-    for secret in ["Tester", "Original Name", "Wood"] {
+    // Names the synthetic save is known to contain: a player nickname, a guild name,
+    // an item id, a Pal species.
+    for secret in ["Tester", "Original Name", "ClothArmor", "Lamball"] {
         assert!(
             !json.contains(secret),
             "diagnostic report leaked {secret:?}: {json}"
@@ -237,11 +302,22 @@ fn pal_stat_edits_cross_the_boundary() {
         .unwrap_err();
     assert_eq!(get(&err, "code").as_string().unwrap(), "value_out_of_range");
 
-    // The synthetic save's only character is a player, so a Pal edit finds nothing.
+    // An instance id no Pal has is refused rather than matching something else.
     let err = handle
         .set_pal_stat("whatever", "talent_hp", 50.0)
         .unwrap_err();
     assert_eq!(get(&err, "code").as_string().unwrap(), "player_not_found");
+
+    // The world's one Pal is editable, and the edit lands on that Pal.
+    let players = js_sys::Array::from(&handle.list_players().unwrap());
+    let owner = get(&players.get(0), "uid").as_string().unwrap();
+    let pals = js_sys::Array::from(&handle.pals_of(&owner).unwrap());
+    let pal_id = get(&pals.get(0), "instance_id").as_string().unwrap();
+    handle
+        .set_pal_stat(&pal_id, "talent_hp", 91.0)
+        .expect("setPalStat");
+    let pals = js_sys::Array::from(&handle.pals_of(&owner).unwrap());
+    assert_eq!(get(&pals.get(0), "talent_hp").as_f64().unwrap(), 91.0);
 
     // The player's own level is editable, and the change survives an export/reopen.
     let players = js_sys::Array::from(&handle.list_players().unwrap());

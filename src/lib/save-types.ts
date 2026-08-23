@@ -130,6 +130,15 @@ export interface SlotView {
   /** Item id as the game stores it, e.g. `PalSphere`. There is no display-name
    *  table in this project, so this is what gets shown. */
   static_id: string | null;
+  /** The four below come from the slot's `DynamicItemSaveData` row. Most items have
+   *  none — one plank of Wood is like any other — so `null` means "not applicable",
+   *  never "we failed to look it up". */
+  durability: number | null;
+  remaining_bullets: number | null;
+  /** Loaded ammunition's item id. The game's `None` sentinel is normalized away. */
+  ammo_static_id: string | null;
+  /** Which Pal is inside, for eggs. */
+  egg_character_id: string | null;
 }
 
 export interface ContainerView {
@@ -151,6 +160,30 @@ export interface ContainerView {
 export interface PlayerInventory {
   player_uid: string;
   containers: ContainerView[];
+}
+
+/** One occupied Pal-box or party slot, joined to the Pal in it. */
+export interface PalSlotView {
+  slot_index: number;
+  instance_id: string;
+  /** `null` means the container references a Pal the world has no entry for — a real
+   *  if rare state in a damaged save, shown rather than hidden. */
+  pal: PalSummary | null;
+}
+
+export interface PalContainerView {
+  kind: 'party' | 'storage';
+  id: string;
+  /** Declared capacity: 5 for a party, 960 for a Pal box. */
+  slot_count: number;
+  slots: PalSlotView[];
+  missing: boolean;
+}
+
+/** A player's Pals by location. Same two-file pairing as {@link PlayerInventory}. */
+export interface PlayerPalStorage {
+  player_uid: string;
+  containers: PalContainerView[];
 }
 
 /** Editable stats. Mirrors the string names `palsave-wasm` parses; an unknown one is

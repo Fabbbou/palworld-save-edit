@@ -104,6 +104,10 @@ export class SaveClient {
     return this.#send({ id: this.#id(), kind: 'playerInventory', uid });
   }
 
+  playerPalStorage(uid: string) {
+    return this.#send({ id: this.#id(), kind: 'playerPalStorage', uid });
+  }
+
   diagnosticReport() {
     return this.#send({ id: this.#id(), kind: 'diagnosticReport' });
   }

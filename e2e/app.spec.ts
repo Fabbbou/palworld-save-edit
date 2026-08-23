@@ -89,8 +89,28 @@ test('dropping level + player together resolves the inventory', async ({ page })
   await expect(page.getByTestId('inventory-empty')).toHaveCount(0);
   await expect(page.getByTestId('inventory-summary')).toBeVisible();
 
-  // The synthetic player's one container holds 5 Wood, joined across both files.
-  await expect(page.getByRole('cell', { name: 'Wood' })).toBeVisible();
+  // The synthetic player's one container holds 5 ClothArmor, joined across both files.
+  await expect(page.getByRole('cell', { name: 'ClothArmor' })).toBeVisible();
+
+  // And its DynamicItemSaveData row resolved — the third file-spanning join. The
+  // fixture's slot carries a non-zero DynamicId precisely so this can't pass on the
+  // "no per-instance state" path.
+  await expect(page.getByRole('cell', { name: '150 dur' })).toBeVisible();
+});
+
+test('dropping level + player together resolves the pal box', async ({ page }) => {
+  await load(page, [LEVEL, PLAYER]);
+  await page.getByTestId('tab-inventory').click();
+
+  // Both Pal containers the player save names must render, capacities included.
+  await expect(page.getByTestId('pal-container-party')).toContainText('Party');
+  const box = page.getByTestId('pal-container-storage');
+  await expect(box).toContainText('Pal box');
+  await expect(box).toContainText('1/960');
+
+  // The slot resolved all the way to a Pal, not just to an instance id.
+  await expect(box.getByRole('cell', { name: 'Lamball' })).toBeVisible();
+  await expect(box.getByRole('cell', { name: '70/?/?' })).toBeVisible();
 });
 
 test('export produces a non-empty download', async ({ page }) => {

@@ -82,6 +82,8 @@ async function handleRequest(req: Request): Promise<{ value: unknown; transfer: 
       return { value: requireHandle().attachedPlayers(), transfer: [] };
     case 'playerInventory':
       return { value: requireHandle().playerInventory(req.uid), transfer: [] };
+    case 'playerPalStorage':
+      return { value: requireHandle().playerPalStorage(req.uid), transfer: [] };
     case 'diagnosticReport':
       return { value: requireHandle().diagnosticReport(), transfer: [] };
     case 'setPalStat':

@@ -245,7 +245,7 @@
         Players {players.length > 0 ? `(${players.length})` : ''}
       </button>
       <button class:active={tab === 'inventory'} onclick={() => (tab = 'inventory')} data-testid="tab-inventory">
-        Inventory {attachedPlayers.length > 0 ? `(${attachedPlayers.length})` : ''}
+        Pals &amp; items {attachedPlayers.length > 0 ? `(${attachedPlayers.length})` : ''}
       </button>
       <button class:active={tab === 'guilds'} onclick={() => (tab = 'guilds')} disabled={guilds.length === 0} data-testid="tab-guilds">
         Guilds {guilds.length > 0 ? `(${guilds.length})` : ''}
